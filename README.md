@@ -5,24 +5,18 @@ A comprehensive file conversion tool that supports:
 - Audio formats (MP4 → MP3, WAV, etc.)
 - YouTube video downloads and conversions
 
-## Features
-- Convert between various image formats
-- Extract audio from video files
-- Download and convert YouTube videos to MP3
-- Batch processing support
-- Simple command-line interface
-
-## Installation
-
+## Quick Start
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/file-converter.git
+# Clone and install
+git clone https://github.com/YOUR-USERNAME/file-converter.git
 cd file-converter
-
-# Install dependencies
 pip install -r requirements.txt
 
-# For YouTube downloads, install ffmpeg:
-# Ubuntu/Debian: sudo apt install ffmpeg
-# MacOS: brew install ffmpeg
-# Windows: Download from ffmpeg.org
+# Convert image
+python main.py image input.jpg output.png
+
+# Extract audio from video
+python main.py audio input.mp4 output.mp3
+
+# Download YouTube as MP3
+python main.py youtube "https://youtube.com/watch?v=VIDEO_ID" audio.mp3
