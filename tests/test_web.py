@@ -1,0 +1,67 @@
+import io
+import time
+
+import pytest
+
+from tests.conftest import needs_ffmpeg
+from webapp import create_app
+
+
+@pytest.fixture
+def client(tmp_path):
+    app = create_app(str(tmp_path / "jobs"))
+    app.testing = True
+    return app.test_client()
+
+
+def wait(client, job_id, timeout=30):
+    end = time.time() + timeout
+    while time.time() < end:
+        job = client.get(f"/api/jobs/{job_id}").get_json()
+        if job["status"] in ("done", "error"):
+            return job
+        time.sleep(0.1)
+    raise AssertionError("job timed out")
+
+
+def test_index_and_formats(client):
+    assert b"Converter" in client.get("/").data
+    reg = client.get("/api/formats").get_json()
+    assert "mp3" in reg["targets"]["mp4"] and "mp3" in reg["url"]
+
+
+def test_image_upload_roundtrip(client, media):
+    data = {"file": (open(media["png"], "rb"), "my photo.png"), "target": "jpg", "quality": "80"}
+    r = client.post("/api/convert", data=data, content_type="multipart/form-data")
+    assert r.status_code == 202
+    job = wait(client, r.get_json()["id"])
+    assert job["status"] == "done" and job["filename"] == "my_photo.jpg"
+    dl = client.get(f"/api/jobs/{job['id']}/download")
+    assert dl.status_code == 200 and dl.data[:3] == b"\xff\xd8\xff"
+
+
+@needs_ffmpeg
+def test_video_upload_to_mp3(client, media):
+    data = {"file": (open(media["mp4"], "rb"), "clip.mp4"), "target": "mp3", "bitrate": "128k"}
+    r = client.post("/api/convert", data=data, content_type="multipart/form-data")
+    job = wait(client, r.get_json()["id"])
+    assert job["status"] == "done" and job["filename"] == "clip.mp3"
+
+
+def test_bad_requests(client):
+    r = client.post("/api/convert", data={"file": (io.BytesIO(b"x"), "a.docx"), "target": "pdf"},
+                    content_type="multipart/form-data")
+    assert r.status_code == 400
+    r = client.post("/api/convert", data={"file": (io.BytesIO(b"x"), "a.png"), "target": "mp3"},
+                    content_type="multipart/form-data")
+    assert r.status_code == 400
+    assert client.post("/api/url", json={"url": "file:///etc/passwd", "target": "mp3"}).status_code == 400
+    assert client.get("/api/jobs/nope").status_code == 404
+    assert client.get("/api/jobs/nope/download").status_code == 404
+
+
+def test_corrupt_file_reports_error(client):
+    r = client.post("/api/convert", data={"file": (io.BytesIO(b"not an image"), "a.png"), "target": "jpg"},
+                    content_type="multipart/form-data")
+    job = wait(client, r.get_json()["id"])
+    assert job["status"] == "error" and "could not be read" in job["error"]
