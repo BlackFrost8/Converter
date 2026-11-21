@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -27,8 +29,30 @@ def safe_filename(name: str, fallback: str = "download") -> str:
     return (name[:120] or fallback)
 
 
+_cookie_copy: Optional[str] = None
+
+
+def _cookie_file() -> Optional[str]:
+    """YTDLP_COOKIES_FILE, copied once to a writable temp file (yt-dlp rewrites it on exit,
+    and hosted secret files are usually read-only)."""
+    global _cookie_copy
+    src = os.environ.get("YTDLP_COOKIES_FILE")
+    if not src or not Path(src).is_file():
+        return None
+    if _cookie_copy is None:
+        fd, _cookie_copy = tempfile.mkstemp(prefix="ytdlp-cookies-", suffix=".txt")
+        os.close(fd)
+        shutil.copyfile(src, _cookie_copy)
+    return _cookie_copy
+
+
 def _base_params(workdir: Path) -> dict:
-    return {
+    extra = {}
+    if cookies := _cookie_file():
+        extra["cookiefile"] = cookies
+    if proxy := os.environ.get("YTDLP_PROXY"):
+        extra["proxy"] = proxy
+    return extra | {
         "outtmpl": str(workdir / "source.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -99,7 +123,7 @@ def download(
         if progress and d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             if total:
-                progress(0.7 * min(d.get("downloaded_bytes", 0) / total, 1.0))
+                progress(0.7 * min(d.get("downloaded_bytes", 0) / total, 1.0), _speed_detail(d))
 
     def too_long(info, *, incomplete):
         dur = info.get("duration")
@@ -135,7 +159,7 @@ def download(
         final = out_dir / f"{title}.{fmt}"
         trimmed = opts.start is not None or opts.end is not None
 
-        sub = (lambda f: progress(0.7 + 0.3 * f)) if progress else None
+        sub = (lambda f: progress(0.7 + 0.3 * f, None)) if progress else None
         if normalize(source.suffix) == fmt and not trimmed:
             source.replace(final)
         else:
@@ -146,6 +170,16 @@ def download(
         progress(1.0)
     logger.info("Downloaded %s -> %s", url, final)
     return final
+
+
+def _speed_detail(d: dict) -> Optional[str]:
+    parts = []
+    speed, eta = d.get("speed"), d.get("eta")
+    if speed:
+        parts.append(f"{speed / 1_048_576:.1f} MB/s")
+    if eta is not None:
+        parts.append(f"{int(eta) // 60}:{int(eta) % 60:02d} left")
+    return " · ".join(parts) or None
 
 
 class YouTubeDownloader:

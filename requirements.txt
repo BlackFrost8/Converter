@@ -1,3 +1,5 @@
 flask>=3.0
 pillow>=10.0
-yt-dlp>=2025.1.1
+# [default] adds yt-dlp-ejs; deno is the JavaScript runtime yt-dlp now needs for YouTube.
+yt-dlp[default]>=2025.11.12
+deno>=2.4

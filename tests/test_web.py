@@ -85,3 +85,23 @@ def test_cors_rejects_other_origins(client):
     r = client.get("/api/formats", headers={"Origin": "https://evil.example"})
     assert "Access-Control-Allow-Origin" not in r.headers
     assert "Access-Control-Allow-Origin" not in client.get("/").headers
+
+
+def test_serves_site_and_health(client):
+    assert client.get("/app.js").status_code == 200
+    assert client.get("/vendor/core/ffmpeg-core.js").status_code == 200
+    assert client.get("/../README.md").status_code == 404
+    assert client.get("/healthz").get_json() == {"ok": True}
+
+
+def test_rate_limit(tmp_path, monkeypatch, media):
+    monkeypatch.setenv("CONVERTER_RATE_LIMIT", "2")
+    app = create_app(str(tmp_path / "jobs"))
+    c = app.test_client()
+    codes = []
+    for _ in range(3):
+        r = c.post("/api/convert", data={"file": (open(media["png"], "rb"), "a.png"), "target": "jpg"},
+                   content_type="multipart/form-data")
+        codes.append(r.status_code)
+    assert codes == [202, 202, 429]
+    assert "Hourly limit" in r.get_json()["error"]

@@ -1,0 +1,13 @@
+# Render Blueprint: Dashboard → New → Blueprint → pick this repo.
+services:
+  - type: web
+    name: converter
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: CONVERTER_ALLOWED_ORIGINS
+        value: https://blackfrost8.github.io
+      # Optional, if YouTube starts asking the server to sign in:
+      # add a Secret File named cookies.txt and set YTDLP_COOKIES_FILE=/etc/secrets/cookies.txt

@@ -17,9 +17,9 @@ from converter.formats import normalize, targets_for
 from converter.youtube_downloader import download, is_valid_url
 
 
-def _progress(p: float) -> None:
+def _progress(p: float, detail: str | None = None) -> None:
     filled = int(p * 30)
-    sys.stderr.write(f"\r  [{'#' * filled}{'.' * (30 - filled)}] {p * 100:5.1f}%")
+    sys.stderr.write(f"\r  [{'#' * filled}{'.' * (30 - filled)}] {p * 100:5.1f}%  {detail or '':<24}")
     sys.stderr.flush()
 
 

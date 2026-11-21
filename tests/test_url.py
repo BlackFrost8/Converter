@@ -33,7 +33,7 @@ class FakeYDL:
             dest = Path(self.params["outtmpl"].replace("%(ext)s", self.source.suffix.lstrip(".")))
             shutil.copy(self.source, dest)
             for hook in self.params.get("progress_hooks", []):
-                hook({"status": "downloading", "downloaded_bytes": 5, "total_bytes": 10})
+                hook({"status": "downloading", "downloaded_bytes": 5, "total_bytes": 10, "speed": 2_097_152, "eta": 75})
         return info
 
 
@@ -53,7 +53,7 @@ def test_safe_filename():
 def test_link_to_mp3(fake, media, tmp_path):
     fake.source = media["mp4"]
     seen = []
-    out = download("https://www.youtube.com/watch?v=x", "mp3", tmp_path, progress=seen.append)
+    out = download("https://www.youtube.com/watch?v=x", "mp3", tmp_path, progress=lambda p, d=None: seen.append(p))
     assert out.name == "Me at the zoo  test.mp3" and out.stat().st_size > 0
     assert fake.calls[0]["format"] == "bestaudio/best"
     assert "-generic" in fake.calls[0]["allowed_extractors"]
@@ -80,3 +80,9 @@ def test_link_validation(fake, media, tmp_path):
         download("ftp://example.com/a", "mp3", tmp_path)
     with pytest.raises(ConversionError):
         download("https://youtu.be/x", "png", tmp_path)
+
+
+def test_speed_detail():
+    from converter.youtube_downloader import _speed_detail
+    assert _speed_detail({"speed": 2_097_152, "eta": 75}) == "2.0 MB/s · 1:15 left"
+    assert _speed_detail({}) is None
