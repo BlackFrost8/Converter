@@ -23,7 +23,7 @@ ENV PYTHONUNBUFFERED=1 \
     CONVERTER_RATE_LIMIT=30 \
     CONVERTER_MAX_UPLOAD_MB=200 \
     CONVERTER_WORKERS=2 \
-    CONVERTER_ALLOWED_ORIGINS=https://blackfrost8.github.io
+    CONVERTER_ALLOWED_ORIGINS=https://convert.froststudio.org,https://blackfrost8.github.io
 
 EXPOSE 8000
 # One process (jobs live in memory), several threads for concurrent requests.

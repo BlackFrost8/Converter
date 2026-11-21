@@ -444,11 +444,11 @@ window.addEventListener("drop", (e) => {
 // ---- link server
 
 // Where links are sent. Order: the visitor's own override (Link service settings),
-// config.js, the site's own origin when it is served by app.py, then a local app.py.
+// the site's own origin when app.py serves the page, config.js, then a local app.py.
 const CONFIG = window.CONVERTER_CONFIG || {};
 function defaultServer() {
+  if (CONFIG.servedByApp) return location.origin;  // app.py serves its own config.js with this flag
   if (CONFIG.linkServer) return CONFIG.linkServer;
-  if (/^https?:$/.test(location.protocol) && !location.hostname.endsWith("github.io")) return location.origin;
   return "http://127.0.0.1:5000";
 }
 const store = {

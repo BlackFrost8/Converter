@@ -44,7 +44,8 @@ No system ffmpeg? `pip install imageio-ffmpeg` provides a bundled binary that is
    That address alone is already a full converter site.
 2. **Point the GitHub Pages site at it.** Edit `docs/config.js` and set
    `linkServer: "https://converter-xxxx.onrender.com"`. Commit and push.
-3. **Turn on Pages:** Settings → Pages → Deploy from a branch → `main`, folder **`/docs`**.
+3. **Turn on Pages:** Settings → Pages → Deploy from a branch → `main`, folder **`/docs`**. The custom domain
+   `convert.froststudio.org` is set by `docs/CNAME`.
 
 Visitors then paste a link, pick MP3 or MP4, and download, with no setup on their side.
 
@@ -70,7 +71,7 @@ Open http://127.0.0.1:5000. The Pages site also uses this local service for link
 | Environment variable        | Default                         | Meaning                                         |
 | --------------------------- | ------------------------------- | ----------------------------------------------- |
 | `HOST` / `PORT`             | `127.0.0.1` / `5000`            | Where `app.py` listens                          |
-| `CONVERTER_ALLOWED_ORIGINS` | `https://blackfrost8.github.io` | Other sites allowed to use this service (CORS)  |
+| `CONVERTER_ALLOWED_ORIGINS` | `https://convert.froststudio.org,https://blackfrost8.github.io` | Other sites allowed to use this service (CORS) |
 | `CONVERTER_RATE_LIMIT`      | `0` (unlimited); Docker: `30`   | Conversions per visitor IP per hour             |
 | `CONVERTER_MAX_QUEUE`       | `20`                            | Jobs waiting or running before "busy" replies   |
 | `CONVERTER_WORKERS`         | `2`                             | Conversions run in parallel                     |

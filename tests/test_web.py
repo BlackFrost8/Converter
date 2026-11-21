@@ -105,3 +105,11 @@ def test_rate_limit(tmp_path, monkeypatch, media):
         codes.append(r.status_code)
     assert codes == [202, 202, 429]
     assert "Hourly limit" in r.get_json()["error"]
+
+
+def test_custom_domain_origin_and_served_config(client):
+    origin = "https://convert.froststudio.org"
+    assert client.get("/api/formats", headers={"Origin": origin}).headers["Access-Control-Allow-Origin"] == origin
+    assert client.get("/healthz", headers={"Origin": origin}).headers["Access-Control-Allow-Origin"] == origin
+    cfg = client.get("/config.js")
+    assert cfg.status_code == 200 and b"servedByApp: true" in cfg.data

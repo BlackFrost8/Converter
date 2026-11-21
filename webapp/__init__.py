@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 SITE_DIR = Path(__file__).resolve().parent.parent / "docs"
 JOB_TTL_SECONDS = 60 * 60  # results are deleted an hour after they finish
+# Where the static (GitHub Pages) copy of the page lives; it may call this service for links.
+DEFAULT_ORIGINS = "https://convert.froststudio.org,https://blackfrost8.github.io"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -188,14 +190,15 @@ def create_app(work_root: Optional[str] = None) -> Flask:
 
     allowed_origins = {
         o.strip().rstrip("/")
-        for o in os.environ.get("CONVERTER_ALLOWED_ORIGINS", "https://blackfrost8.github.io").split(",")
+        for o in os.environ.get("CONVERTER_ALLOWED_ORIGINS", DEFAULT_ORIGINS).split(",")
         if o.strip()
     }
 
     @app.after_request
     def headers(response):
         origin = request.headers.get("Origin", "").rstrip("/")
-        if request.path.startswith("/api/") and (origin in allowed_origins or "*" in allowed_origins):
+        is_api = request.path.startswith("/api/") or request.path == "/healthz"
+        if is_api and (origin in allowed_origins or "*" in allowed_origins):
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type"
@@ -220,6 +223,12 @@ def create_app(work_root: Optional[str] = None) -> Flask:
     @app.get("/")
     def index():
         return send_from_directory(SITE_DIR, "index.html")
+
+    @app.get("/config.js")
+    def site_config():
+        # Overrides docs/config.js: this page should send links to this same server.
+        body = 'window.CONVERTER_CONFIG = { linkServer: "", servedByApp: true };\n'
+        return app.response_class(body, mimetype="text/javascript", headers={"Cache-Control": "no-cache"})
 
     @app.get("/<path:filename>")
     def site_file(filename):
