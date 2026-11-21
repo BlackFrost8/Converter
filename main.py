@@ -17,7 +17,9 @@ from converter.formats import normalize, targets_for
 from converter.youtube_downloader import download, is_valid_url
 
 
-def _progress(p: float, detail: str | None = None) -> None:
+def _progress(p: float | None, detail: str | None = None) -> None:
+    if p is None:
+        return
     filled = int(p * 30)
     sys.stderr.write(f"\r  [{'#' * filled}{'.' * (30 - filled)}] {p * 100:5.1f}%  {detail or '':<24}")
     sys.stderr.flush()
@@ -26,7 +28,7 @@ def _progress(p: float, detail: str | None = None) -> None:
 def cmd_convert(args) -> int:
     opts = Options(
         audio_bitrate=args.bitrate, gif_fps=args.fps, gif_width=args.width,
-        image_quality=args.quality, start=args.start, end=args.end,
+        image_quality=args.quality, start=args.start, end=args.end, max_height=args.height,
     )
     out = Path(args.output)
     # "mp3" alone means: same name, new format. Otherwise it's a path.
@@ -74,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--fps", type=int, default=12, help="GIF frame rate")
     c.add_argument("--width", type=int, default=480, help="GIF width in px (0 = original)")
     c.add_argument("--quality", type=int, default=90, help="JPG/WebP quality 1-100")
+    c.add_argument("--height", type=int, default=0, help="video: max height, e.g. 720 (0 = original)")
     c.add_argument("--start", type=float, help="trim start, seconds")
     c.add_argument("--end", type=float, help="trim end, seconds")
     c.set_defaults(func=cmd_convert)

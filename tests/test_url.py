@@ -13,6 +13,8 @@ class FakeYDL:
     """Stands in for yt_dlp.YoutubeDL: 'downloads' a local sample file."""
     source: Path = None
     calls = []
+    extractions = 0
+    duration = 3
 
     def __init__(self, params):
         self.params = params
@@ -24,11 +26,21 @@ class FakeYDL:
     def __exit__(self, *a):
         return False
 
+    @staticmethod
+    def sanitize_info(info):
+        return info
+
     def extract_info(self, url, download=True):
-        info = {"title": "Me at the zoo / test", "duration": 3, "extractor_key": "Youtube"}
+        FakeYDL.extractions += 1
+        info = {"title": "Me at the zoo / test", "duration": FakeYDL.duration, "extractor_key": "Youtube",
+                "formats": [{"height": 240, "vcodec": "avc1"}, {"height": 720, "vcodec": "vp9"},
+                            {"height": None, "vcodec": "none"}]}
+        return self.process_ie_result(info, download) if download else info
+
+    def process_ie_result(self, info, download=True):
         reason = self.params.get("match_filter", lambda i, incomplete: None)(info, incomplete=False)
         if reason:
-            raise yt_dlp.utils.DownloadError(reason)
+            return info  # yt-dlp skips filtered videos without raising
         if download:
             dest = Path(self.params["outtmpl"].replace("%(ext)s", self.source.suffix.lstrip(".")))
             shutil.copy(self.source, dest)
@@ -39,7 +51,11 @@ class FakeYDL:
 
 @pytest.fixture
 def fake(monkeypatch, media):
+    from converter import youtube_downloader
     FakeYDL.calls = []
+    FakeYDL.extractions = 0
+    FakeYDL.duration = 3
+    youtube_downloader._info_cache.clear()
     monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
     return FakeYDL
 
@@ -86,3 +102,30 @@ def test_speed_detail():
     from converter.youtube_downloader import _speed_detail
     assert _speed_detail({"speed": 2_097_152, "eta": 75}) == "2.0 MB/s · 1:15 left"
     assert _speed_detail({}) is None
+
+
+@needs_ffmpeg
+def test_info_is_reused_by_download(fake, media, tmp_path):
+    from converter.youtube_downloader import fetch_info
+    fake.source = media["mp4"]
+    info = fetch_info("https://youtu.be/abc")
+    assert info["heights"] == [240, 720]
+    download("https://youtu.be/abc", "mp3", tmp_path)
+    assert fake.extractions == 1
+
+
+@needs_ffmpeg
+def test_quality_cap_in_format(fake, media, tmp_path):
+    fake.source = media["mp4"]
+    download("https://youtu.be/q", "webm", tmp_path, Options(max_height=480))
+    assert "height<=480" in fake.calls[-1]["format"]
+    assert fake.calls[-1]["format"].startswith("bv*[height<=480][vcodec^=avc1]")
+    download("https://youtu.be/q", "gif", tmp_path, Options(end=1))
+    assert "height<=720" in fake.calls[-1]["format"]
+
+
+def test_too_long_reports_reason(fake, media, tmp_path):
+    fake.source = media["mp4"]
+    fake.duration = 5 * 3600
+    with pytest.raises(ConversionError, match="too long"):
+        download("https://youtu.be/long", "mp3", tmp_path)

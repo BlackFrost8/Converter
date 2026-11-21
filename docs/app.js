@@ -297,7 +297,8 @@ async function convertFile(file, fmt, o, onProgress) {
     return bytes(await runFFmpeg(file, (i) => [...trimIn(o), "-i", i, ...trimOut(o), "-filter_complex", graph, "-an", "-loop", "0"], out, { trim, onProgress }));
   }
   if (VIDEO_OUT.includes(fmt)) {
-    return bytes(await runFFmpeg(file, (i) => [...trimIn(o), "-i", i, "-map", "0:v:0", "-map", "0:a:0?", ...trimOut(o), "-vf", EVEN, ...VIDEO_ARGS[fmt]], out, { trim, onProgress }));
+    const scale = o.max_height ? `scale=-2:'trunc(min(ih,${o.max_height})/2)*2'` : EVEN; // never upscales
+    return bytes(await runFFmpeg(file, (i) => [...trimIn(o), "-i", i, "-map", "0:v:0", "-map", "0:a:0?", ...trimOut(o), "-vf", scale, ...VIDEO_ARGS[fmt]], out, { trim, onProgress }));
   }
   if (AUDIO_OUT.includes(fmt)) {
     return bytes(await runFFmpeg(file, (i) => [...trimIn(o), "-i", i, "-map", "0:a:0", "-vn", ...trimOut(o), ...AUDIO_ARGS[fmt](o.bitrate)], out, { trim, onProgress }));
@@ -308,18 +309,85 @@ async function convertFile(file, fmt, o, onProgress) {
   throw new ConversionError(`Cannot convert .${ext} to .${fmt}.`);
 }
 
+
+// ------------------------------------------------------------ zip (store only, for "Download all")
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+/** Build an uncompressed ZIP (media files don't compress further anyway). */
+async function makeZip(entries) {
+  const enc = new TextEncoder();
+  const now = new Date();
+  const time = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+  const date = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  const parts = [], central = [], used = new Set();
+  let offset = 0;
+  for (const { name, blob } of entries) {
+    let unique = name;
+    for (let i = 1; used.has(unique); i++) unique = name.replace(/(\.[^.]*)?$/, ` (${i})$1`);
+    used.add(unique);
+    const nameBytes = enc.encode(unique);
+    const data = new Uint8Array(await blob.arrayBuffer());
+    const crc = crc32(data);
+    if (offset + data.length > 0xfffffffe) throw new Error("Too large for one zip. Download the files one by one.");
+
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true); local.setUint16(4, 20, true); local.setUint16(6, 0x0800, true);
+    local.setUint16(10, time, true); local.setUint16(12, date, true); local.setUint32(14, crc, true);
+    local.setUint32(18, data.length, true); local.setUint32(22, data.length, true);
+    local.setUint16(26, nameBytes.length, true);
+    parts.push(local, nameBytes, data);
+
+    const head = new DataView(new ArrayBuffer(46));
+    head.setUint32(0, 0x02014b50, true); head.setUint16(4, 20, true); head.setUint16(6, 20, true);
+    head.setUint16(8, 0x0800, true); head.setUint16(12, time, true); head.setUint16(14, date, true);
+    head.setUint32(16, crc, true); head.setUint32(20, data.length, true); head.setUint32(24, data.length, true);
+    head.setUint16(28, nameBytes.length, true); head.setUint32(42, offset, true);
+    central.push(head, nameBytes);
+    offset += 30 + nameBytes.length + data.length;
+  }
+  const size = central.reduce((n, p) => n + p.byteLength, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, entries.length, true); end.setUint16(10, entries.length, true);
+  end.setUint32(12, size, true); end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, end], { type: "application/zip" });
+}
+
 // ------------------------------------------------------------ UI
 
-const state = { mode: "file", file: null, ext: null, target: null, busy: false, cancel: null, objectUrl: null };
+const state = {
+  mode: "file",
+  items: [],        // { id, file, ext, status: idle|running|done|error, progress, blob, url, name, error }
+  target: null,
+  busy: false,
+  cancel: null,
+  zipUrl: null,
+  heights: null,    // available video heights for the current link
+};
+let nextId = 1;
 
 const el = {
-  drop: $("drop"), fileInput: $("file-input"), dropTitle: $("drop-title"), dropSub: $("drop-sub"),
+  drop: $("drop"), fileInput: $("file-input"), dropTitle: $("drop-title"), dropSub: $("drop-sub"), queue: $("queue"),
   url: $("url-input"), urlInfo: $("url-info"), urlThumb: $("url-thumb"), urlTitle: $("url-title"), urlMeta: $("url-meta"),
-  server: $("server-input"), serverDot: $("server-dot"), serverHint: $("server-hint"),
-  targets: $("targets"), options: $("options"), go: $("go"),
+  server: $("server-input"), serverDot: $("server-dot"), serverHint: $("server-hint"), advanced: $("advanced"),
+  targets: $("targets"), options: $("options"), res: $("res-select"), go: $("go"),
   status: $("status"), bar: $("bar-fill"), statusText: $("status-text"), statusPct: $("status-pct"),
-  statusDetail: $("status-detail"), cancel: $("cancel"), advanced: $("advanced"),
-  result: $("result"), download: $("download"), again: $("again"),
+  statusDetail: $("status-detail"), cancel: $("cancel"),
+  result: $("result"), preview: $("preview"), resultNote: $("result-note"), download: $("download"), again: $("again"),
 };
 
 const bytesLabel = (n) => {
@@ -335,21 +403,36 @@ const clock = (s) => {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
   return (h ? `${h}:${String(m).padStart(2, "0")}` : m) + ":" + String(sec).padStart(2, "0");
 };
+const stemOf = (name) => name.replace(/\.[^.]+$/, "") || "converted";
+
+// ---- targets & options
 
 function availableTargets() {
   if (state.mode === "url") return URL_OUT;
-  return state.ext ? targetsFor(state.ext) : [];
+  if (!state.items.length) return [];
+  // Formats every queued file can become.
+  return state.items.map((it) => targetsFor(it.ext)).reduce((a, b) => a.filter((f) => b.includes(f)));
 }
 
 function renderTargets() {
   const list = availableTargets();
   el.targets.innerHTML = "";
-  if (!list.length) { el.targets.hidden = true; state.target = null; return updateUI(); }
+  if (!list.length) {
+    state.target = null;
+    if (state.mode === "file" && state.items.length > 1) {
+      el.targets.innerHTML = '<p class="hint">These files have no format in common. Remove some, or convert them in separate batches.</p>';
+      el.targets.hidden = false;
+    } else {
+      el.targets.hidden = true;
+    }
+    return updateUI();
+  }
   if (!list.includes(state.target)) state.target = null;
+  const cats = new Set(state.items.map((it) => categoryOf(it.ext)));
   const groups = [
     ["Video", list.filter((f) => VIDEO_OUT.includes(f))],
     ["Audio", list.filter((f) => AUDIO_OUT.includes(f))],
-    [state.mode === "file" && categoryOf(state.ext) === "video" ? "Still frame" : "Image",
+    [state.mode === "file" && cats.size === 1 && cats.has("video") ? "Still frame" : "Image",
       list.filter((f) => !VIDEO_OUT.includes(f) && !AUDIO_OUT.includes(f))],
   ];
   for (const [label, formats] of groups) {
@@ -363,7 +446,7 @@ function renderTargets() {
       b.className = "chip" + (f === state.target ? " is-selected" : "");
       b.textContent = f;
       b.setAttribute("aria-pressed", f === state.target);
-      b.addEventListener("click", () => { state.target = f; renderTargets(); });
+      b.addEventListener("click", () => { if (!state.busy) { state.target = f; renderTargets(); } });
       chips.appendChild(b);
     }
     el.targets.appendChild(wrap);
@@ -372,25 +455,42 @@ function renderTargets() {
   updateUI();
 }
 
+function renderResolution() {
+  const keep = el.res.value;
+  const heights = state.mode === "url" && state.heights?.length
+    ? [...state.heights].reverse().filter((h) => h >= 144 && h <= 2160)
+    : [1080, 720, 480, 360];
+  const top = state.mode === "url" ? "Best available" : "Original";
+  el.res.innerHTML = `<option value="0">${top}</option>` +
+    [...new Set(heights)].map((h) => `<option value="${h}">${h}p</option>`).join("");
+  if ([...el.res.options].some((o) => o.value === keep)) el.res.value = keep;
+}
+
 function updateOptions() {
   const t = state.target;
-  const cat = state.mode === "url" ? "url" : categoryOf(state.ext);
+  const cats = state.mode === "url" ? new Set(["url"]) : new Set(state.items.map((it) => categoryOf(it.ext)));
+  const fromGif = state.items.some((it) => it.ext === "gif");
   const show = {
     bitrate: LOSSY_AUDIO.includes(t),
-    quality: cat === "image" && (t === "jpg" || t === "webp"),
-    gif: t === "gif" && cat !== "image",
-    trim: ["video", "audio", "url"].includes(cat) || (cat === "image" && state.ext === "gif" && VIDEO_OUT.includes(t)),
+    quality: cats.has("image") && (t === "jpg" || t === "webp"),
+    gif: t === "gif" && !cats.has("image"),
+    res: VIDEO_OUT.includes(t) && t !== "gif",
+    trim: cats.has("video") || cats.has("audio") || cats.has("url") || (fromGif && VIDEO_OUT.includes(t)),
   };
   let any = false;
   el.options.querySelectorAll(".opt").forEach((o) => { o.hidden = !show[o.dataset.opt]; any ||= !o.hidden; });
   el.options.hidden = !t || !any;
+  const resLabel = el.options.querySelector('[data-opt="res"] .opt-label');
+  if (resLabel) resLabel.textContent = state.mode === "url" ? "Video quality" : "Resolution";
 }
 
 function updateUI() {
   updateOptions();
-  const ready = state.mode === "file" ? state.file && state.target : el.url.value.trim() && state.target;
+  const n = state.items.length;
+  const ready = state.mode === "file" ? n && state.target : el.url.value.trim() && state.target;
   el.go.disabled = !ready || state.busy;
-  el.go.textContent = state.target ? `Convert to ${state.target.toUpperCase()}` : "Convert";
+  const what = state.mode === "file" && n > 1 ? `Convert ${n} files` : "Convert";
+  el.go.textContent = state.target ? `${what} to ${state.target.toUpperCase()}` : what;
 }
 
 function readOptions() {
@@ -401,6 +501,7 @@ function readOptions() {
     quality: Math.min(100, Math.max(1, num("quality") ?? 90)),
     gif_fps: Math.min(50, Math.max(1, num("gif_fps") ?? 12)),
     gif_width: Math.min(1920, Math.max(0, num("gif_width") ?? 480)),
+    max_height: num("max_height") || 0,
     start: num("start"),
     end: num("end"),
   };
@@ -411,37 +512,123 @@ function readOptions() {
   return o;
 }
 
-// ---- file input
+// ---- file queue
 
-function setFile(file) {
-  if (!file) return;
-  resetResult();
-  state.file = file;
-  state.ext = extOf(file.name);
-  el.drop.classList.add("has-file");
-  el.dropTitle.textContent = file.name;
-  if (!categoryOf(state.ext)) {
-    el.dropSub.textContent = `.${state.ext || "?"} files are not supported`;
-    state.ext = null;
-  } else {
-    const big = file.size > 1.5 * 1024 ** 3 ? " · very large files may exceed browser memory" : "";
-    el.dropSub.textContent = `${bytesLabel(file.size)} · choose a format below${big}`;
-  }
-  renderTargets();
-  loadFFmpeg().catch(() => {}); // warm up while the user picks a format
+function releaseItem(it) {
+  if (it.url) URL.revokeObjectURL(it.url);
+  it.url = null; it.blob = null;
 }
 
-el.fileInput.addEventListener("change", () => setFile(el.fileInput.files[0]));
+function addFiles(files) {
+  if (state.busy) return;
+  resetResult();
+  let skipped = 0;
+  for (const file of files) {
+    const ext = extOf(file.name);
+    if (!categoryOf(ext)) { skipped++; continue; }
+    state.items.push({ id: nextId++, file, ext, status: "idle", progress: 0, blob: null, url: null, name: null, error: null });
+  }
+  renderQueue();
+  renderTargets();
+  el.dropSub.textContent = skipped
+    ? `Skipped ${skipped} unsupported file${skipped > 1 ? "s" : ""}.`
+    : el.dropSub.dataset.default;
+  if (state.items.length) loadFFmpeg().catch(() => {}); // warm up while the user picks a format
+}
+
+function removeItem(id) {
+  if (state.busy) return;
+  const i = state.items.findIndex((it) => it.id === id);
+  if (i < 0) return;
+  releaseItem(state.items[i]);
+  state.items.splice(i, 1);
+  resetResult();
+  renderQueue();
+  renderTargets();
+}
+
+function renderQueue() {
+  const n = state.items.length;
+  el.queue.hidden = !n;
+  el.drop.classList.toggle("is-compact", n > 0);
+  el.dropTitle.textContent = n ? "Add more files" : "Drop files, or click to choose";
+  el.queue.innerHTML = "";
+  for (const it of state.items) {
+    const li = document.createElement("li");
+    li.className = `item is-${it.status}`;
+    li.dataset.id = it.id;
+    li.innerHTML = `
+      <div class="item-main">
+        <span class="item-name"></span>
+        <span class="item-meta"></span>
+      </div>
+      <div class="item-side">
+        <span class="item-state"></span>
+        <a class="item-dl" hidden>Download</a>
+        <button class="item-remove" type="button" aria-label="Remove">×</button>
+      </div>
+      <div class="item-bar"><span></span></div>
+      <div class="item-error" hidden></div>`;
+    li.querySelector(".item-name").textContent = it.file.name;
+    li.querySelector(".item-meta").textContent = `${bytesLabel(it.file.size)} · ${it.ext.toUpperCase()}`;
+    li.querySelector(".item-remove").addEventListener("click", () => removeItem(it.id));
+    el.queue.appendChild(li);
+    paintItem(it);
+  }
+}
+
+function paintItem(it) {
+  const li = el.queue.querySelector(`[data-id="${it.id}"]`);
+  if (!li) return;
+  li.className = `item is-${it.status}`;
+  const stateText = { idle: "", running: `${Math.round(it.progress * 100)}%`, done: bytesLabel(it.blob?.size), error: "Failed" }[it.status];
+  li.querySelector(".item-state").textContent = it.status === "running" && it.progress === 0 ? "Starting" : stateText;
+  li.querySelector(".item-bar span").style.width = `${Math.round((it.status === "done" ? 1 : it.progress) * 100)}%`;
+  const dl = li.querySelector(".item-dl");
+  dl.hidden = !(it.status === "done" && it.url) || state.items.length === 1; // single file: the big button covers it
+  if (it.url) { dl.href = it.url; dl.download = it.name; }
+  const err = li.querySelector(".item-error");
+  err.hidden = it.status !== "error";
+  err.textContent = it.error || "";
+  li.querySelector(".item-remove").hidden = state.busy;
+}
+
+el.fileInput.addEventListener("change", () => { addFiles([...el.fileInput.files]); el.fileInput.value = ""; });
 ["dragenter", "dragover"].forEach((ev) => el.drop.addEventListener(ev, (e) => { e.preventDefault(); el.drop.classList.add("is-over"); }));
 ["dragleave", "drop"].forEach((ev) => el.drop.addEventListener(ev, (e) => { e.preventDefault(); el.drop.classList.remove("is-over"); }));
-el.drop.addEventListener("drop", (e) => setFile(e.dataTransfer.files[0]));
 window.addEventListener("dragover", (e) => e.preventDefault());
 window.addEventListener("drop", (e) => {
   e.preventDefault();
-  if (state.mode === "file" && !state.busy && e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+  el.drop.classList.remove("is-over");
+  if (!e.dataTransfer.files.length || state.busy) return;
+  if (state.mode !== "file") switchMode("file");
+  addFiles([...e.dataTransfer.files]);
 });
 
-// ---- link server
+// Paste a link anywhere to convert it; paste an image or file to queue it.
+window.addEventListener("paste", (e) => {
+  if (state.busy) return;
+  const t = e.target;
+  const typing = t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement;
+  const files = [...(e.clipboardData?.files || [])];
+  if (files.length) {
+    e.preventDefault();
+    if (state.mode !== "file") switchMode("file");
+    addFiles(files.map((f, i) => (f.name && f.name !== "image.png") ? f
+      : new File([f], `pasted-${Date.now()}${i ? "-" + i : ""}.${(f.type.split("/")[1] || "png").replace("jpeg", "jpg")}`, { type: f.type })));
+    return;
+  }
+  if (typing) return;
+  const text = (e.clipboardData?.getData("text") || "").trim();
+  if (/^https?:\/\/\S+$/.test(text)) {
+    e.preventDefault();
+    if (state.mode !== "url") switchMode("url");
+    el.url.value = text;
+    el.url.dispatchEvent(new Event("input"));
+  }
+});
+
+// ---- link service
 
 // Where links are sent. Order: the visitor's own override (Link service settings),
 // the site's own origin when app.py serves the page, config.js, then a local app.py.
@@ -454,10 +641,12 @@ function defaultServer() {
 const store = {
   get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
   set: (k, v) => { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } },
+  del: (k) => { try { localStorage.removeItem(k); } catch { /* storage unavailable */ } },
 };
 el.server.value = store.get("linkServer") || defaultServer();
 el.server.placeholder = defaultServer();
 const serverBase = () => el.server.value.trim().replace(/\/+$/, "");
+const isLocalServer = () => /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(serverBase());
 
 async function api(path, body) {
   const res = await fetch(serverBase() + path, body === undefined ? {} : {
@@ -465,7 +654,7 @@ async function api(path, body) {
   });
   let data = {};
   try { data = await res.json(); } catch { /* non-JSON error page */ }
-  if (!res.ok) throw new Error(data.error || `Link server error (${res.status}).`);
+  if (!res.ok) throw new Error(data.error || `Link service error (${res.status}).`);
   return data;
 }
 
@@ -482,18 +671,17 @@ async function checkServer(timeoutMs = 5000) {
     serverOk = false;
   }
   el.serverDot.className = "dot " + (serverOk ? "is-ok" : "is-bad");
-  el.serverDot.title = serverOk ? "Link server connected" : "Link server not reachable";
+  el.serverDot.title = serverOk ? "Link service connected" : "Link service not reachable";
   el.serverHint.hidden = serverOk;
   return serverOk;
 }
 el.server.addEventListener("change", () => {
   const v = serverBase();
-  if (!v || v === defaultServer()) { el.server.value = defaultServer(); try { localStorage.removeItem("linkServer"); } catch {} }
+  if (!v || v === defaultServer()) { el.server.value = defaultServer(); store.del("linkServer"); }
   else store.set("linkServer", v);
+  infoFor = "";
   checkServer();
 });
-
-const isLocalServer = () => /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(serverBase());
 
 /** Make sure the link service is up, waiting for a sleeping free-tier host to wake. */
 async function ensureServer() {
@@ -513,45 +701,63 @@ el.url.addEventListener("input", () => {
   resetResult();
   updateUI();
   clearTimeout(infoTimer);
-  infoTimer = setTimeout(loadInfo, 700);
+  infoTimer = setTimeout(loadInfo, 600);
 });
 
 async function loadInfo() {
   const url = el.url.value.trim();
-  if (!/^https?:\/\/\S+\.\S+/.test(url) || url === infoFor) { if (!url) el.urlInfo.hidden = true; return; }
+  if (!/^https?:\/\/\S+\.\S+/.test(url)) {
+    if (!url) { el.urlInfo.hidden = true; state.heights = null; renderResolution(); }
+    return;
+  }
+  if (url === infoFor) return;
   if (!serverOk && !(await checkServer(isLocalServer() ? 5000 : 70000))) return;
   infoFor = url;
   el.urlInfo.hidden = false;
-  el.urlThumb.src = "";
+  el.urlInfo.classList.add("is-loading");
+  el.urlThumb.removeAttribute("src");
   el.urlTitle.textContent = "Looking up link…";
   el.urlMeta.textContent = "";
   try {
     const data = await api("/api/url/info", { url });
     if (url !== el.url.value.trim()) return;
-    el.urlThumb.src = data.thumbnail || "";
+    if (data.thumbnail) el.urlThumb.src = data.thumbnail;
     el.urlTitle.textContent = data.title || url;
     el.urlMeta.textContent = [data.site, data.uploader, clock(data.duration)].filter(Boolean).join(" · ");
+    state.heights = data.heights || null;
+    renderResolution();
   } catch (err) {
     if (url !== el.url.value.trim()) return;
     infoFor = "";
     el.urlTitle.textContent = err.message;
+  } finally {
+    el.urlInfo.classList.remove("is-loading");
   }
 }
 
 // ---- modes
 
-document.querySelectorAll(".mode").forEach((btn) => btn.addEventListener("click", () => {
+function switchMode(mode) {
   if (state.busy) return;
-  state.mode = btn.dataset.mode;
-  document.querySelectorAll(".mode").forEach((b) => { b.classList.toggle("is-active", b === btn); b.setAttribute("aria-selected", b === btn); });
-  document.querySelectorAll(".pane").forEach((p) => { p.hidden = p.dataset.pane !== state.mode; });
+  state.mode = mode;
+  document.querySelectorAll(".mode").forEach((b) => {
+    const on = b.dataset.mode === mode;
+    b.classList.toggle("is-active", on);
+    b.setAttribute("aria-selected", on);
+  });
+  document.querySelectorAll(".pane").forEach((p) => { p.hidden = p.dataset.pane !== mode; });
   state.target = null;
   resetResult();
+  renderResolution();
   renderTargets();
-  if (state.mode === "url") { el.url.focus(); if (!serverOk) checkServer(isLocalServer() ? 5000 : 70000); }
-}));
+  if (mode === "url") {
+    el.url.focus();
+    if (!serverOk) checkServer(isLocalServer() ? 5000 : 70000);
+  }
+}
+document.querySelectorAll(".mode").forEach((btn) => btn.addEventListener("click", () => switchMode(btn.dataset.mode)));
 
-// ---- run
+// ---- status panel
 
 // Percentage readout eases toward the real value so it counts up smoothly between updates.
 let shownPct = 0, targetPct = 0, pctRaf = 0;
@@ -589,70 +795,150 @@ function resetResult() {
   el.status.hidden = true;
   el.result.hidden = true;
   el.go.hidden = false;
-  if (state.objectUrl) { URL.revokeObjectURL(state.objectUrl); state.objectUrl = null; }
-}
-
-function finish(href, filename, size, sameOrigin) {
-  el.status.hidden = true;
-  el.go.hidden = true;
-  el.result.hidden = false;
-  el.download.href = href;
-  if (sameOrigin) el.download.download = filename; else el.download.removeAttribute("download");
-  el.download.textContent = `Download ${filename}${size ? ` · ${bytesLabel(size)}` : ""}`;
+  el.preview.innerHTML = "";
+  el.preview.hidden = true;
+  if (state.zipUrl) { URL.revokeObjectURL(state.zipUrl); state.zipUrl = null; }
 }
 
 function setBusy(busy, cancel = null) {
   state.busy = busy;
   state.cancel = cancel;
   el.cancel.hidden = !cancel;
+  el.drop.classList.toggle("is-disabled", busy);
   if (busy) el.go.hidden = true;                    // the progress panel takes the button's place
   else if (el.result.hidden) el.go.hidden = false;  // error / cancel: offer the button again
+  state.items.forEach(paintItem);
   updateUI();
 }
 
-async function runFile() {
+function showPreview(src, fmt) {
+  const type = MIME[fmt] || "";
+  let node = null;
+  if (type.startsWith("audio/")) {
+    node = document.createElement("audio");
+    node.controls = true;
+  } else if (type.startsWith("video/") && fmt !== "avi" && fmt !== "mkv") {
+    node = document.createElement("video");
+    node.controls = true; node.muted = true; node.playsInline = true; node.preload = "metadata";
+  } else if (type.startsWith("image/") && fmt !== "tiff") {
+    node = document.createElement("img");
+    node.alt = "Preview of the converted file";
+  }
+  el.preview.innerHTML = "";
+  if (!node) { el.preview.hidden = true; return; }
+  node.src = src;
+  node.addEventListener("error", () => { el.preview.hidden = true; }); // e.g. a format this browser can't play
+  el.preview.appendChild(node);
+  el.preview.hidden = false;
+}
+
+function finish({ href, filename, size, sameOrigin, previewSrc, fmt, note = "" }) {
+  el.status.hidden = true;
+  el.go.hidden = true;
+  el.result.hidden = false;
+  el.download.href = href;
+  if (sameOrigin) el.download.download = filename; else el.download.removeAttribute("download");
+  el.download.textContent = `Download ${filename}${size ? ` · ${bytesLabel(size)}` : ""}`;
+  el.resultNote.textContent = note;
+  el.resultNote.hidden = !note;
+  if (previewSrc) showPreview(previewSrc, fmt); else { el.preview.hidden = true; el.preview.innerHTML = ""; }
+}
+
+// ---- run: files
+
+async function runFiles() {
   const o = readOptions();
   const target = state.target;
-  const stem = state.file.name.replace(/\.[^.]+$/, "") || "converted";
+  const items = state.items;
+  const n = items.length;
+  items.forEach((it) => { releaseItem(it); it.status = "idle"; it.progress = 0; it.error = null; });
   let cancelled = false;
   setBusy(true, () => { cancelled = true; cancelFFmpeg(); });
+
   const showLoad = (p) => showStatus("Loading converter", { progress: p, detail: "First run only · 31 MB, cached afterwards" });
   try {
     if (!wasmBlobUrl) { showLoad(loadProgress); onLoadProgress = showLoad; }
     else if (!ffmpeg) showStatus("Starting converter");
     await loadFFmpeg();
     onLoadProgress = null;
-    if (cancelled) return;
-    showStatus("Converting", { progress: 0, detail: `${state.file.name} → ${target.toUpperCase()}` });
-    const blob = await convertFile(state.file, target, o,
-      (p) => showStatus("Converting", { progress: p, detail: `${state.file.name} → ${target.toUpperCase()}` }));
-    state.objectUrl = URL.createObjectURL(blob);
-    finish(state.objectUrl, `${stem}.${target}`, blob.size, true);
-  } catch (err) {
-    if (cancelled) showStatus("Cancelled.", { error: true });
-    else throw err;
+
+    for (let i = 0; i < n && !cancelled; i++) {
+      const it = items[i];
+      const label = n > 1 ? `Converting ${i + 1} of ${n}` : "Converting";
+      const detail = `${it.file.name} → ${target.toUpperCase()}`;
+      it.status = "running";
+      paintItem(it);
+      showStatus(label, { progress: i / n, detail });
+      try {
+        if (!ffmpeg) await loadFFmpeg(); // restarted after a failure
+        const blob = await convertFile(it.file, target, o, (p) => {
+          it.progress = p;
+          paintItem(it);
+          showStatus(label, { progress: (i + p) / n, detail });
+        });
+        it.blob = blob;
+        it.name = `${stemOf(it.file.name)}.${target}`;
+        it.url = URL.createObjectURL(blob);
+        it.status = "done";
+      } catch (err) {
+        if (cancelled) break;
+        it.status = "error";
+        it.error = err.message || "Conversion failed.";
+      }
+      it.progress = it.status === "done" ? 1 : it.progress;
+      paintItem(it);
+    }
   } finally {
     onLoadProgress = null;
     setBusy(false);
   }
+
+  if (cancelled) {
+    items.forEach((it) => { if (it.status === "running") { it.status = "idle"; it.progress = 0; } paintItem(it); });
+    return showStatus("Cancelled.", { error: true });
+  }
+  const done = items.filter((it) => it.status === "done");
+  const failed = n - done.length;
+  if (!done.length) {
+    throw new Error(n === 1 ? items[0].error : `None of the ${n} files could be converted. See the errors above.`);
+  }
+  if (n === 1) {
+    const it = done[0];
+    return finish({ href: it.url, filename: it.name, size: it.blob.size, sameOrigin: true, previewSrc: it.url, fmt: target });
+  }
+  const zip = await makeZip(done.map((it) => ({ name: it.name, blob: it.blob })));
+  state.zipUrl = URL.createObjectURL(zip);
+  finish({
+    href: state.zipUrl, filename: `converted-${target}.zip`, size: zip.size, sameOrigin: true,
+    note: failed ? `${done.length} converted · ${failed} failed` : `${done.length} files converted`,
+  });
+  el.download.textContent = `Download all (.zip) · ${bytesLabel(zip.size)}`;
 }
+
+// ---- run: links
 
 async function runLink() {
   const o = readOptions();
-  const body = { url: el.url.value.trim(), target: state.target, bitrate: o.bitrate, gif_fps: o.gif_fps, gif_width: o.gif_width };
+  const target = state.target;
+  const body = { url: el.url.value.trim(), target, bitrate: o.bitrate, gif_fps: o.gif_fps, gif_width: o.gif_width, max_height: o.max_height };
   if (o.start != null) body.start = o.start;
   if (o.end != null) body.end = o.end;
-  let cancelled = false;
-  setBusy(true, () => { cancelled = true; });
+  let cancelled = false, jobId = null;
+  setBusy(true, () => {
+    cancelled = true;
+    if (jobId) api(`/api/jobs/${jobId}/cancel`, {}).catch(() => {}); // stop the work on the server too
+  });
   showStatus("Connecting");
   try {
     await ensureServer();
-    if (cancelled) return;
+    if (cancelled) return showStatus("Cancelled.", { error: true });
     const job = await api("/api/url", body);
+    jobId = job.id;
     while (!cancelled) {
       const j = await api(`/api/jobs/${job.id}`);
       if (j.status === "done") {
-        return finish(`${serverBase()}/api/jobs/${j.id}/download`, j.filename, j.size, false);
+        const base = `${serverBase()}/api/jobs/${j.id}/download`;
+        return finish({ href: base, filename: j.filename, size: j.size, sameOrigin: false, previewSrc: `${base}?inline=1`, fmt: target });
       }
       if (j.status === "error") throw new Error(j.error || "Conversion failed.");
       if (j.status === "queued") showStatus("Waiting in queue", { detail: "Other conversions are running." });
@@ -671,7 +957,7 @@ el.go.addEventListener("click", async () => {
   resetResult();
   if (state.mode === "url" && !el.urlThumb.getAttribute("src")) el.urlInfo.hidden = true; // avoid a duplicate error line
   try {
-    await (state.mode === "file" ? runFile() : runLink());
+    await (state.mode === "file" ? runFiles() : runLink());
   } catch (err) {
     const msg = err instanceof TypeError ? "Lost connection to the link service. Try again." : err.message;
     showStatus(msg || "Conversion failed.", { error: true });
@@ -682,16 +968,27 @@ el.cancel.addEventListener("click", () => state.cancel && state.cancel());
 el.again.addEventListener("click", () => {
   resetResult();
   if (state.mode === "file") {
-    state.file = null; state.ext = null; state.target = null;
-    el.fileInput.value = "";
-    el.drop.classList.remove("has-file");
-    el.dropTitle.textContent = "Drop a file, or click to choose";
+    state.items.forEach(releaseItem);
+    state.items = [];
+    state.target = null;
+    renderQueue();
     el.dropSub.textContent = el.dropSub.dataset.default;
+  } else {
+    el.url.value = "";
+    el.urlInfo.hidden = true;
+    infoFor = "";
+    state.heights = null;
+    renderResolution();
+    el.url.focus();
   }
   renderTargets();
 });
 
+// ---- boot
+
 el.dropSub.dataset.default = el.dropSub.textContent;
+renderResolution();
+renderQueue();
 renderTargets();
 // Quietly wake a sleeping hosted link service early, so links are fast when needed.
 // (Not for a local one: pinging localhost on page load makes Chrome show a permission prompt.)

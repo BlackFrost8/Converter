@@ -28,8 +28,10 @@ No system ffmpeg? `pip install imageio-ffmpeg` provides a bundled binary that is
 ## How it fits together
 
 - **The page** (`docs/`) converts files **in the visitor's browser** with
-  [ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm). Nothing is uploaded. A progress bar shows the
-  one-time engine download (31 MB, cached afterwards) and then the conversion percentage.
+  [ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm). Nothing is uploaded. Drop several files at once
+  and download them individually or as one zip; preview the result before downloading; paste a link or an
+  image anywhere on the page. A progress bar shows the one-time engine download (31 MB, cached afterwards)
+  and then the conversion percentage.
 - **The link service** (`app.py`) downloads YouTube and other links with yt-dlp, converts them with ffmpeg,
   and hands back the file, with download speed and time left shown in the progress bar. Browsers can't download
   YouTube media themselves, so links always need this service running somewhere.
@@ -53,7 +55,9 @@ Things to know about free hosting:
 
 - Render's free tier sleeps after about 15 minutes idle. The page pings the service when it opens, and shows
   "Waking up the link service" if a conversion starts before it is awake (up to about a minute).
-- YouTube often blocks or rate-limits downloads from data-centre servers ("Sign in to confirm you're not a bot").
+- YouTube sometimes answers data-centre servers with "Sign in to confirm you're not a bot", especially after
+  many requests in a short time. In testing it came and went within minutes. The page then shows
+  "YouTube is blocking this server right now"; trying again later usually works.
   If that happens, add a `cookies.txt` exported from a logged-in browser as a Render **Secret File** and set
   `YTDLP_COOKIES_FILE=/etc/secrets/cookies.txt`, or route downloads through a proxy with `YTDLP_PROXY`.
   Cookies tie downloads to that account; use a spare one.
@@ -76,6 +80,7 @@ Open http://127.0.0.1:5000. The Pages site also uses this local service for link
 | `CONVERTER_MAX_QUEUE`       | `20`                            | Jobs waiting or running before "busy" replies   |
 | `CONVERTER_WORKERS`         | `2`                             | Conversions run in parallel                     |
 | `CONVERTER_MAX_UPLOAD_MB`   | `1024`; Docker: `200`           | Upload limit for the `/api/convert` endpoint    |
+| `CONVERTER_MAX_DOWNLOAD_MB` | `2048`; Docker: `500`           | Largest file a link may download (0 = no limit) |
 | `CONVERTER_BEHIND_PROXY`    | unset; Docker: `1`              | Trust one reverse proxy for the client IP       |
 | `CONVERTER_WORKDIR`         | system temp dir                 | Where downloads and results live (1 hour)       |
 | `YTDLP_COOKIES_FILE`        | unset                           | Cookies file for yt-dlp                         |
@@ -89,6 +94,7 @@ Jobs live in memory, so run a single server process (the Dockerfile uses one gun
 python main.py convert input.mp4 mp3                       # -> input.mp3
 python main.py convert input.mp4 clip.gif --start 5 --end 9 --fps 15 --width 640
 python main.py convert photo.png photo.webp --quality 80
+python main.py convert talk.mov talk.mp4 --height 720           # shrink to 720p
 python main.py convert "https://www.youtube.com/watch?v=VIDEO_ID" mp3
 python main.py formats video.mkv                           # list possible outputs
 python main.py serve --port 8000                           # same as app.py
