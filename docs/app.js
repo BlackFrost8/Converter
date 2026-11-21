@@ -684,16 +684,42 @@ el.server.addEventListener("change", () => {
 });
 
 /** Make sure the link service is up, waiting for a sleeping free-tier host to wake. */
+// Free hosts (Render) sleep when idle and take a minute or two to start again. While starting,
+// requests can fail quickly or hang, so keep retrying instead of trusting a single attempt.
+const WAKE_LIMIT_MS = 150000;
+let waking = null;
+
+function waitForServer(onTick) {
+  if (isLocalServer()) return checkServer(5000);
+  if (!waking) {
+    waking = (async () => {
+      const start = Date.now();
+      while (Date.now() - start < WAKE_LIMIT_MS) {
+        if (await checkServer(15000)) return true;
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+      return false;
+    })().finally(() => { waking = null; });
+  }
+  const started = Date.now();
+  const timer = onTick ? setInterval(() => onTick(Math.round((Date.now() - started) / 1000)), 1000) : null;
+  return waking.finally(() => timer && clearInterval(timer));
+}
+
+/** Make sure the link service is up, waiting for a sleeping free-tier host to wake. */
 async function ensureServer() {
-  if (await checkServer(5000)) return;
+  if (await checkServer(8000)) return;
   if (isLocalServer()) {
     el.advanced.open = true;
     throw new Error('No link service is running on this computer. Start one with "python app.py", or set a link service below.');
   }
-  showStatus("Waking up the link service", { detail: "This can take up to a minute after it has been idle." });
-  if (await checkServer(70000)) return;
+  const tell = (secs) => showStatus("Waking up the link service", {
+    detail: `It sleeps when nobody has used it for a while. Usually ready within a minute${secs ? ` · ${secs}s` : ""}.`,
+  });
+  tell(0);
+  if (await waitForServer(tell)) return;
   el.advanced.open = true;
-  throw new Error("The link service is offline right now. Try again later.");
+  throw new Error("The link service didn't respond after 2½ minutes. It may be down; try again later.");
 }
 
 let infoTimer = null, infoFor = "";
@@ -711,7 +737,18 @@ async function loadInfo() {
     return;
   }
   if (url === infoFor) return;
-  if (!serverOk && !(await checkServer(isLocalServer() ? 5000 : 70000))) return;
+  if (!serverOk) {
+    el.urlInfo.hidden = false;
+    el.urlInfo.classList.add("is-loading");
+    el.urlThumb.removeAttribute("src");
+    el.urlMeta.textContent = "";
+    const tell = (secs) => { el.urlTitle.textContent = `Waking up the link service…${secs ? ` ${secs}s` : ""}`; };
+    tell(0);
+    const ok = await waitForServer(tell);
+    el.urlInfo.classList.remove("is-loading");
+    if (url !== el.url.value.trim()) return;
+    if (!ok) { el.urlTitle.textContent = "The link service isn't responding right now."; return; }
+  }
   infoFor = url;
   el.urlInfo.hidden = false;
   el.urlInfo.classList.add("is-loading");
@@ -752,7 +789,7 @@ function switchMode(mode) {
   renderTargets();
   if (mode === "url") {
     el.url.focus();
-    if (!serverOk) checkServer(isLocalServer() ? 5000 : 70000);
+    if (!serverOk) waitForServer();
   }
 }
 document.querySelectorAll(".mode").forEach((btn) => btn.addEventListener("click", () => switchMode(btn.dataset.mode)));
@@ -992,4 +1029,4 @@ renderQueue();
 renderTargets();
 // Quietly wake a sleeping hosted link service early, so links are fast when needed.
 // (Not for a local one: pinging localhost on page load makes Chrome show a permission prompt.)
-if (!isLocalServer()) checkServer(70000);
+if (!isLocalServer()) waitForServer();
