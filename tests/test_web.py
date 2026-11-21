@@ -65,3 +65,23 @@ def test_corrupt_file_reports_error(client):
                     content_type="multipart/form-data")
     job = wait(client, r.get_json()["id"])
     assert job["status"] == "error" and "could not be read" in job["error"]
+
+
+def test_cors_for_pages_origin(client):
+    origin = "https://blackfrost8.github.io"
+    r = client.get("/api/formats", headers={"Origin": origin})
+    assert r.headers["Access-Control-Allow-Origin"] == origin
+    pre = client.options("/api/url", headers={
+        "Origin": origin,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Private-Network": "true",
+    })
+    assert pre.status_code == 200
+    assert pre.headers["Access-Control-Allow-Private-Network"] == "true"
+    assert "Content-Type" in pre.headers["Access-Control-Allow-Headers"]
+
+
+def test_cors_rejects_other_origins(client):
+    r = client.get("/api/formats", headers={"Origin": "https://evil.example"})
+    assert "Access-Control-Allow-Origin" not in r.headers
+    assert "Access-Control-Allow-Origin" not in client.get("/").headers

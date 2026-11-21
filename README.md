@@ -39,11 +39,37 @@ Conversions run in the background with live progress; results are deleted an hou
 | `CONVERTER_MAX_UPLOAD_MB`  | `1024`                   | Upload size limit               |
 | `CONVERTER_WORKERS`        | `2`                      | Conversions run in parallel     |
 | `CONVERTER_WORKDIR`        | system temp dir          | Where uploads and results live  |
+| `CONVERTER_ALLOWED_ORIGINS`| `https://blackfrost8.github.io` | Sites allowed to use this server for links (CORS) |
 
 The built-in server is meant for personal or local-network use. To expose it publicly, run it behind a
 production WSGI server (e.g. `gunicorn -w 1 --threads 8 app:app`) and add authentication: anyone with
 access can make the server download and transcode media. Use a single worker process, because job state
 lives in memory.
+
+## GitHub Pages (browser) version
+
+`docs/` is a static copy of the interface that converts files **inside the visitor's browser** using
+[ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm). Nothing is uploaded, and no server is needed for files.
+
+To publish it: repository **Settings → Pages → Build and deployment → Deploy from a branch**, choose the
+branch that contains `docs/`, folder **`/docs`**, then save. The site appears at
+`https://<user>.github.io/Converter/` after a minute or two.
+
+**Links (YouTube etc.) need a link server.** Browsers won't let a web page download YouTube media from
+another site, and GitHub Pages can't run code. So the Link tab sends links to the Python app in this repo:
+
+```bash
+python app.py        # on your own computer; the Pages site talks to http://127.0.0.1:5000
+```
+
+Or deploy `app.py` somewhere public and enter its address in the "Link server" box. The server only accepts
+requests from origins listed in `CONVERTER_ALLOWED_ORIGINS` (default `https://blackfrost8.github.io`;
+comma-separated).
+
+Browser notes: Chrome may ask permission before a public site can talk to a server on your computer or local
+network. Safari may block an https page from calling `http://127.0.0.1`. Use Chrome, Edge or Firefox for the Link tab.
+In-browser conversion is single-threaded and slower than the Python app; very large files can exceed the
+browser's memory.
 
 ## Command line
 
@@ -85,4 +111,4 @@ pytest
 
 ## License
 
-MIT
+MIT. The bundled ffmpeg.wasm core in `docs/vendor/core/` is GPL-2.0-or-later; see `docs/vendor/README.md`.

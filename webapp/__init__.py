@@ -136,6 +136,27 @@ def create_app(work_root: Optional[str] = None) -> Flask:
     store = JobStore(root, workers=int(os.environ.get("CONVERTER_WORKERS", "2")))
     app.extensions["jobs"] = store
 
+    # Let the static GitHub Pages front end (docs/) use this server for links.
+    allowed_origins = {
+        o.strip().rstrip("/")
+        for o in os.environ.get("CONVERTER_ALLOWED_ORIGINS", "https://blackfrost8.github.io").split(",")
+        if o.strip()
+    }
+
+    @app.after_request
+    def cors(response):
+        origin = request.headers.get("Origin", "").rstrip("/")
+        if request.path.startswith("/api/") and (origin in allowed_origins or "*" in allowed_origins):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            response.headers["Access-Control-Max-Age"] = "600"
+            response.headers.add("Vary", "Origin")
+            # Chrome asks before a public site may call a server on localhost / the LAN.
+            if request.headers.get("Access-Control-Request-Private-Network") == "true":
+                response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
+
     @app.errorhandler(ConversionError)
     def conversion_error(e):
         return jsonify(error=str(e)), 400
