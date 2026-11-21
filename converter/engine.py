@@ -81,8 +81,13 @@ def probe_duration(src: Path) -> Optional[float]:
     return _parse_ts(match.group(1)) if match else None
 
 
+EMPTY_OUTPUT = ("Output file is empty", "nothing was encoded")
+
+
 def _friendly(stderr: str) -> str:
     text = stderr.strip()
+    if any(m in text for m in EMPTY_OUTPUT):
+        return "Nothing to convert: the chosen start/end range is past the end of the file."
     if "matches no streams" in text or "does not contain any stream" in text:
         return "The file has no stream of the type needed for that format (for example, a video with no audio track)."
     if "Invalid data found" in text:
@@ -99,9 +104,9 @@ def run_ffmpeg(
     progress: Optional[ProgressFn] = None,
 ) -> None:
     cmd = [
-        ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        ffmpeg_path(), "-hide_banner", "-nostdin", "-y",
         *input_args, *output_args,
-        "-progress", "pipe:1", "-nostats", str(dst),
+        "-progress", "pipe:1", "-nostats", "-loglevel", "warning", str(dst),
     ]
     logger.debug("Running: %s", " ".join(cmd))
     with tempfile.TemporaryFile(mode="w+") as err:
@@ -115,10 +120,11 @@ def run_ffmpeg(
                 except ValueError:
                     pass
         code = proc.wait()
-        if code != 0:
-            err.seek(0)
+        err.seek(0)
+        errors = err.read()
+        if code != 0 or any(m in errors for m in EMPTY_OUTPUT):
             dst.unlink(missing_ok=True)
-            raise ConversionError(_friendly(err.read()))
+            raise ConversionError(_friendly(errors))
     if progress:
         progress(1.0)
 
@@ -184,7 +190,7 @@ def _to_video(src: Path, dst: Path, fmt: str, opts: Options, progress) -> None:
 
 
 def _to_gif(src: Path, dst: Path, opts: Options, progress) -> None:
-    scale = f",scale={opts.gif_width}:-1:flags=lanczos" if opts.gif_width else ""
+    scale = f",scale='min({opts.gif_width},iw)':-1:flags=lanczos" if opts.gif_width else ""  # never upscale
     graph = (
         f"[0:v]fps={opts.gif_fps}{scale},split[a][b];"
         f"[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5"

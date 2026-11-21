@@ -80,3 +80,17 @@ def test_audio_to_audio(media, tmp_path):
 def test_no_audio_track_is_friendly(media, tmp_path):
     with pytest.raises(ConversionError, match="no stream"):
         convert(media["silent"], "mp3", tmp_path / "s.mp3")
+
+
+@needs_ffmpeg
+def test_trim_past_end_is_an_error(media, tmp_path):
+    with pytest.raises(ConversionError, match="past the end"):
+        convert(media["mp4"], "webm", tmp_path / "late.webm", Options(start=30, end=31))
+    assert not (tmp_path / "late.webm").exists()
+
+
+@needs_ffmpeg
+def test_gif_never_upscales(media, tmp_path):
+    out = convert(media["mp4"], "gif", tmp_path / "small.gif", Options(end=1, gif_width=480))
+    with Image.open(out) as g:
+        assert g.size[0] == 160
