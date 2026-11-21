@@ -94,3 +94,32 @@ def test_gif_never_upscales(media, tmp_path):
     out = convert(media["mp4"], "gif", tmp_path / "small.gif", Options(end=1, gif_width=480))
     with Image.open(out) as g:
         assert g.size[0] == 160
+
+
+@needs_ffmpeg
+def test_max_height_scales_down_never_up(media, tmp_path):
+    small = convert(media["mp4"], "mkv", tmp_path / "s.mkv", Options(max_height=60))
+    big = convert(media["mp4"], "mov", tmp_path / "b.mov", Options(max_height=1080))
+    import subprocess
+    def size(p):
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-i", str(p)], capture_output=True, text=True).stderr
+        import re
+        return re.search(r"Video: .*?(\d{2,5})x(\d{2,5})", out).groups()
+    assert size(small) == ("80", "60")
+    assert size(big) == ("160", "120")
+
+
+@needs_ffmpeg
+def test_cancel_kills_ffmpeg_and_removes_output(media, tmp_path):
+    from converter.engine import Cancelled
+    calls = []
+
+    def progress(p, detail=None):
+        calls.append(p)
+        if len(calls) >= 1:
+            raise Cancelled()
+
+    dst = tmp_path / "c.webm"
+    with pytest.raises(Cancelled):
+        convert(media["mp4"], "webm", dst, progress=progress)
+    assert not dst.exists()

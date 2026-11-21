@@ -30,19 +30,20 @@
       <!-- File mode -->
       <div class="pane" data-pane="file">
         <label class="drop" id="drop">
-          <input type="file" id="file-input" hidden>
+          <input type="file" id="file-input" multiple hidden>
           <span class="drop-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m6 10 6-6 6 6"/><path d="M4 20h16"/></svg>
           </span>
-          <span class="drop-title" id="drop-title">Drop a file, or click to choose</span>
+          <span class="drop-title" id="drop-title">Drop files, or click to choose</span>
           <span class="drop-sub" id="drop-sub">Converted on your device. Nothing is uploaded.</span>
         </label>
+        <ul class="queue" id="queue" hidden aria-label="Files to convert"></ul>
       </div>
 
       <!-- Link mode -->
       <div class="pane" data-pane="url" hidden>
         <div class="url-row">
-          <input type="url" id="url-input" placeholder="https://www.youtube.com/watch?v=…" autocomplete="off" spellcheck="false">
+          <input type="url" id="url-input" placeholder="Paste a YouTube link…" autocomplete="off" spellcheck="false" aria-label="Video link">
         </div>
         <details class="advanced" id="advanced">
           <summary>Link service <span class="dot" id="server-dot" aria-hidden="true"></span></summary>
@@ -86,6 +87,9 @@
           <label class="opt" data-opt="gif">GIF width (px, 0 = original)
             <input name="gif_width" type="number" min="0" max="1920" step="10" value="480">
           </label>
+          <label class="opt" data-opt="res"><span class="opt-label">Resolution</span>
+            <select name="max_height" id="res-select"></select>
+          </label>
           <label class="opt" data-opt="trim">Start (seconds)
             <input name="start" type="number" min="0" step="0.1" placeholder="0">
           </label>
@@ -108,12 +112,14 @@
       </div>
 
       <div class="result" id="result" hidden>
+        <div class="preview" id="preview" hidden></div>
+        <p class="result-note" id="result-note" hidden></p>
         <a class="download" id="download" href="#">Download</a>
         <button class="again" id="again" type="button">Convert another</button>
       </div>
     </section>
 
-    <footer class="foot">Files never leave your device. Links are fetched by the link server you choose.</footer>
+    <footer class="foot">Files never leave your device. Links are fetched by the link service.</footer>
   </main>
 
   <script src="motes.js"></script>

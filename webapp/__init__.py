@@ -24,7 +24,7 @@ from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
-from converter.engine import ConversionError, Options, convert
+from converter.engine import Cancelled, ConversionError, Options, convert
 from converter.formats import category_of, normalize, registry, targets_for
 from converter.youtube_downloader import download, fetch_info, is_valid_url
 
@@ -55,6 +55,7 @@ class Job:
     download_name: Optional[str] = None
     finished_at: Optional[float] = None
     created_at: float = field(default_factory=time.time)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def public(self) -> dict:
         return {
@@ -95,10 +96,16 @@ class JobStore:
 
     def submit(self, job: Job, fn) -> None:
         def run():
+            if job.cancel_event.is_set():
+                job.error, job.status, job.finished_at = "Cancelled.", "error", time.time()
+                return
             job.status = "running"
 
-            def progress(p: float, detail: Optional[str] = None):
-                job.progress = max(job.progress, p)
+            def progress(p: Optional[float], detail: Optional[str] = None):
+                if job.cancel_event.is_set():
+                    raise Cancelled()
+                if p is not None:
+                    job.progress = max(job.progress, p)
                 job.detail = detail
 
             try:
@@ -108,8 +115,9 @@ class JobStore:
                 job.progress = 1.0
                 job.detail = None
                 job.status = "done"
-            except ConversionError as e:
+            except ConversionError as e:  # includes Cancelled
                 job.error, job.status = str(e), "error"
+                shutil.rmtree(job.workdir / "out", ignore_errors=True)
             except Exception:  # never leak tracebacks to the browser
                 logger.exception("Job %s crashed", job.id)
                 job.error, job.status = "Unexpected error during conversion.", "error"
@@ -168,6 +176,7 @@ def _options(data) -> Options:
             gif_fps=int(data.get("gif_fps") or 12),
             gif_width=int(data.get("gif_width") if data.get("gif_width") not in (None, "") else 480),
             image_quality=int(data.get("quality") or 90),
+            max_height=int(data.get("max_height") or 0),
             start=_float(data.get("start")),
             end=_float(data.get("end")),
         ).validate()
@@ -297,11 +306,22 @@ def create_app(work_root: Optional[str] = None) -> Flask:
             abort(404)
         return jsonify(job.public())
 
+    @app.post("/api/jobs/<job_id>/cancel")
+    def job_cancel(job_id):
+        job = store.get(job_id)
+        if not job:
+            abort(404)
+        job.cancel_event.set()
+        return jsonify(job.public())
+
     @app.get("/api/jobs/<job_id>/download")
     def job_download(job_id):
         job = store.get(job_id)
         if not job or job.status != "done" or not job.output or not job.output.exists():
             abort(404)
-        return send_file(job.output, as_attachment=True, download_name=job.download_name)
+        # ?inline=1 lets the page preview the result in an <audio>/<video>/<img> element.
+        inline = request.args.get("inline") == "1"
+        return send_file(job.output, as_attachment=not inline, download_name=job.download_name,
+                         conditional=True)
 
     return app

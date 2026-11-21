@@ -113,3 +113,25 @@ def test_custom_domain_origin_and_served_config(client):
     assert client.get("/healthz", headers={"Origin": origin}).headers["Access-Control-Allow-Origin"] == origin
     cfg = client.get("/config.js")
     assert cfg.status_code == 200 and b"servedByApp: true" in cfg.data
+
+
+@needs_ffmpeg
+def test_cancel_endpoint_and_inline_preview(client, media):
+    r = client.post("/api/convert", data={"file": (open(media["mp4"], "rb"), "clip.mp4"), "target": "wav"},
+                    content_type="multipart/form-data")
+    job = wait(client, r.get_json()["id"])
+    inline = client.get(f"/api/jobs/{job['id']}/download?inline=1")
+    assert inline.status_code == 200 and "attachment" not in inline.headers.get("Content-Disposition", "")
+    assert client.post("/api/jobs/nope/cancel").status_code == 404
+
+
+def test_cancelled_queued_job(tmp_path):
+    from webapp import JobStore
+    store = JobStore(tmp_path, workers=1, max_queue=5)
+    job = store.new()
+    job.cancel_event.set()
+    store.submit(job, lambda progress: None)
+    deadline = time.time() + 5
+    while job.status != "error" and time.time() < deadline:
+        time.sleep(0.05)
+    assert job.error == "Cancelled."

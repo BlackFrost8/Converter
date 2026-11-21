@@ -17,11 +17,20 @@ from .formats import AUDIO_OUT, FRAME_OUT, IMAGE_OUT, VIDEO_OUT, category_of, no
 
 logger = logging.getLogger(__name__)
 
-ProgressFn = Callable[..., None]  # progress(fraction) or progress(fraction, detail)
+# progress(fraction) or progress(fraction, detail). fraction may be None: "still working, no number yet",
+# which gives the caller a chance to cancel by raising Cancelled.
+ProgressFn = Callable[..., None]
 
 
 class ConversionError(Exception):
     """Raised when a conversion cannot be performed. The message is user-facing."""
+
+
+class Cancelled(ConversionError):
+    """Raised from a progress callback to stop a conversion."""
+
+    def __init__(self, message: str = "Cancelled."):
+        super().__init__(message)
 
 
 @dataclass
@@ -32,6 +41,7 @@ class Options:
     image_quality: int = 90       # jpg / webp
     start: Optional[float] = None  # seconds, trims audio/video/gif
     end: Optional[float] = None
+    max_height: int = 0           # video outputs: shrink to at most this many lines (0 = original)
 
     def validate(self) -> "Options":
         if not re.fullmatch(r"\d{2,3}k", self.audio_bitrate):
@@ -39,6 +49,7 @@ class Options:
         self.gif_fps = max(1, min(int(self.gif_fps), 50))
         self.gif_width = max(0, min(int(self.gif_width), 1920))
         self.image_quality = max(1, min(int(self.image_quality), 100))
+        self.max_height = max(0, min(int(self.max_height), 4320))
         if self.start is not None and self.start < 0:
             raise ConversionError("Start time cannot be negative.")
         if self.start is not None and self.end is not None and self.end <= self.start:
@@ -112,13 +123,22 @@ def run_ffmpeg(
     with tempfile.TemporaryFile(mode="w+") as err:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True)
         assert proc.stdout is not None
-        for line in proc.stdout:
-            if progress and duration and line.startswith("out_time_us="):
-                try:
-                    done = int(line.split("=", 1)[1]) / 1_000_000
-                    progress(max(0.0, min(done / duration, 0.99)))
-                except ValueError:
-                    pass
+        try:
+            for line in proc.stdout:
+                if progress and line.startswith("out_time_us="):
+                    fraction = None
+                    try:
+                        if duration:
+                            done = int(line.split("=", 1)[1]) / 1_000_000
+                            fraction = max(0.0, min(done / duration, 0.99))
+                    except ValueError:
+                        pass
+                    progress(fraction)  # may raise Cancelled
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            dst.unlink(missing_ok=True)
+            raise
         code = proc.wait()
         err.seek(0)
         errors = err.read()
@@ -139,6 +159,14 @@ def _trim_output(opts: Options) -> list[str]:
 
 
 EVEN_DIMS = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+
+def _video_scale(opts: Options) -> str:
+    """Even dimensions (needed by H.264), optionally capped at max_height; never upscales."""
+    if not opts.max_height:
+        return EVEN_DIMS
+    h = opts.max_height
+    return f"scale=-2:'trunc(min(ih,{h})/2)*2'"
 
 AUDIO_CODECS = {
     "mp3": lambda br: ["-c:a", "libmp3lame", "-b:a", br],
@@ -184,7 +212,7 @@ def _to_audio(src: Path, dst: Path, fmt: str, opts: Options, progress) -> None:
 def _to_video(src: Path, dst: Path, fmt: str, opts: Options, progress) -> None:
     run_ffmpeg(
         [*_trim_input(opts), "-i", str(src)],
-        ["-map", "0:v:0", "-map", "0:a:0?", *_trim_output(opts), "-vf", EVEN_DIMS, *VIDEO_CODECS[fmt]],
+        ["-map", "0:v:0", "-map", "0:a:0?", *_trim_output(opts), "-vf", _video_scale(opts), *VIDEO_CODECS[fmt]],
         dst, _media_length(src, opts), progress,
     )
 

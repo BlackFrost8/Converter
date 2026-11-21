@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import re
 import shutil
 import tempfile
+import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from .engine import ConversionError, Options, ProgressFn, convert, ffmpeg_path
+from .engine import Cancelled, ConversionError, Options, ProgressFn, convert, ffmpeg_path
 from .formats import AUDIO_OUT, URL_OUT, normalize
 
 logger = logging.getLogger(__name__)
@@ -65,23 +69,62 @@ def _base_params(workdir: Path) -> dict:
     }
 
 
+# Info fetched for the preview is reused by the download a moment later, so YouTube sees one
+# extraction per conversion instead of two (fewer requests, less bot-check pressure).
+_INFO_TTL = 15 * 60
+_INFO_MAX = 64
+_info_cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+_info_lock = threading.Lock()
+
+
+def _cache_put(url: str, info: dict) -> None:
+    with _info_lock:
+        _info_cache[url] = (time.time(), info)
+        _info_cache.move_to_end(url)
+        while len(_info_cache) > _INFO_MAX:
+            _info_cache.popitem(last=False)
+
+
+def _cache_get(url: str) -> Optional[dict]:
+    with _info_lock:
+        hit = _info_cache.get(url)
+        if not hit or time.time() - hit[0] > _INFO_TTL:
+            _info_cache.pop(url, None)
+            return None
+        return copy.deepcopy(hit[1])
+
+
+def _heights(info: dict) -> list[int]:
+    return sorted({
+        f["height"] for f in info.get("formats") or []
+        if f.get("height") and f.get("vcodec") not in (None, "none")
+    })
+
+
 def fetch_info(url: str) -> dict:
     import yt_dlp
 
+    url = url.strip()
     if not is_valid_url(url):
         raise ConversionError("That does not look like a valid http(s) link.")
-    with tempfile.TemporaryDirectory() as tmp:
-        try:
-            with yt_dlp.YoutubeDL(_base_params(Path(tmp))) as ydl:
-                info = ydl.extract_info(url, download=False)
-        except yt_dlp.utils.DownloadError as e:
-            raise ConversionError(_clean(str(e)))
+    info = _cache_get(url)
+    if info is None:
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                with yt_dlp.YoutubeDL(_base_params(Path(tmp))) as ydl:
+                    info = ydl.sanitize_info(ydl.extract_info(url, download=False))
+            except yt_dlp.utils.DownloadError as e:
+                raise ConversionError(_clean(str(e)))
+        if info.get("_type") in ("playlist", "multi_video"):
+            raise ConversionError("Playlists aren't supported. Paste a link to a single video.")
+        _cache_put(url, info)
     return {
         "title": info.get("title"),
         "duration": info.get("duration"),
         "uploader": info.get("uploader"),
         "thumbnail": info.get("thumbnail"),
         "site": info.get("extractor_key"),
+        "heights": _heights(info),
     }
 
 
@@ -106,10 +149,12 @@ def download(
 ) -> Path:
     """Download ``url`` and convert it to ``target``. Returns the output file path.
 
-    Progress: 0–0.7 is the download, 0.7–1.0 the conversion.
+    Progress: 0–0.7 is the download, 0.7–1.0 the conversion. ``options.max_height`` caps the
+    video quality fetched. Raise :class:`Cancelled` from ``progress`` to stop.
     """
     import yt_dlp
 
+    url = url.strip()
     fmt = normalize(target)
     if fmt not in URL_OUT:
         raise ConversionError(f"Links can be converted to: {', '.join(URL_OUT)}.")
@@ -118,40 +163,79 @@ def download(
     opts = (options or Options()).validate()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    max_mb = _max_download_mb()
 
     def hook(d):
-        if progress and d.get("status") == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate")
-            if total:
-                progress(0.7 * min(d.get("downloaded_bytes", 0) / total, 1.0), _speed_detail(d))
+        if not progress or d.get("status") != "downloading":
+            return
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        fraction = 0.7 * min(d.get("downloaded_bytes", 0) / total, 1.0) if total else None
+        try:
+            progress(fraction, _speed_detail(d))
+        except Cancelled:
+            raise yt_dlp.utils.DownloadCancelled("Cancelled.")  # the exception yt-dlp lets through
+
+    rejected: list[str] = []
 
     def too_long(info, *, incomplete):
         dur = info.get("duration")
+        reason = None
         if info.get("is_live"):
-            return "Live streams are not supported."
-        if dur and dur > MAX_SECONDS:
-            return f"Video is too long ({int(dur // 60)} min; limit is {MAX_SECONDS // 60} min)."
-        return None
+            reason = "Live streams are not supported."
+        elif dur and dur > MAX_SECONDS:
+            reason = f"Video is too long ({int(dur // 60)} min; the limit is {MAX_SECONDS // 60} min)."
+        if reason:
+            rejected.append(reason)
+        return reason
+
+    # GIFs are small; don't fetch more video than they can use.
+    height = opts.max_height or 1080
+    if fmt == "gif":
+        height = min(height, 720)
 
     with tempfile.TemporaryDirectory(dir=out_dir) as tmp:
         workdir = Path(tmp)
         params = _base_params(workdir) | {"progress_hooks": [hook], "match_filter": too_long}
+        if max_mb:
+            params["max_filesize"] = max_mb * 1024 * 1024
         if fmt in AUDIO_OUT:
             params["format"] = "bestaudio/best"
         else:
-            params["format"] = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b"
+            params["format"] = (
+                f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/bv*[height<={height}]+ba"
+                f"/b[height<={height}]/wv*+ba/w"
+            )
             params["merge_output_format"] = "mp4"
 
+        cached = _cache_get(url)
         try:
             with yt_dlp.YoutubeDL(params) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = None
+                if cached is not None:
+                    try:
+                        info = ydl.process_ie_result(cached, download=True)
+                    except yt_dlp.utils.DownloadError:
+                        # Stream URLs can expire; extract again from scratch.
+                        for leftover in workdir.iterdir():
+                            leftover.unlink(missing_ok=True)
+                        info = None
+                if info is None:
+                    info = ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadCancelled:
+            raise Cancelled()
         except yt_dlp.utils.DownloadError as e:
             raise ConversionError(_clean(str(e)))
+        if rejected:
+            raise ConversionError(rejected[0])
         if info is None:
-            raise ConversionError("Nothing was downloaded (the video may have been filtered out).")
+            raise ConversionError("Nothing was downloaded.")
+        if info.get("_type") in ("playlist", "multi_video"):
+            raise ConversionError("Playlists aren't supported. Paste a link to a single video.")
 
         files = [p for p in workdir.iterdir() if p.name.startswith("source.") and not p.name.endswith(".part")]
         if not files:
+            if max_mb:
+                raise ConversionError(f"Nothing was downloaded. The video may be larger than this server's {max_mb} MB limit.")
             raise ConversionError("Download finished but no media file was produced.")
         source = max(files, key=lambda p: p.stat().st_size)
 
@@ -159,17 +243,24 @@ def download(
         final = out_dir / f"{title}.{fmt}"
         trimmed = opts.start is not None or opts.end is not None
 
-        sub = (lambda f: progress(0.7 + 0.3 * f, None)) if progress else None
+        sub = (lambda f: progress(None if f is None else 0.7 + 0.3 * f, None)) if progress else None
         if normalize(source.suffix) == fmt and not trimmed:
             source.replace(final)
         else:
-            # Some downloads arrive as .webm/.m4a etc; the engine handles those as inputs.
+            # Downloads often arrive as .webm/.m4a; the engine takes those as inputs.
             convert(source, fmt, final, opts, sub)
 
     if progress:
         progress(1.0)
     logger.info("Downloaded %s -> %s", url, final)
     return final
+
+
+def _max_download_mb() -> int:
+    try:
+        return int(os.environ.get("CONVERTER_MAX_DOWNLOAD_MB", "2048"))
+    except ValueError:
+        return 2048
 
 
 def _speed_detail(d: dict) -> Optional[str]:
