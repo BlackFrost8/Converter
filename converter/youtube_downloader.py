@@ -201,9 +201,12 @@ def download(
         if fmt in AUDIO_OUT:
             params["format"] = "bestaudio/best"
         else:
+            # Prefer H.264 (avc1): it plays everywhere. YouTube's default pick is often AV1,
+            # which many phones, older PCs and older Macs can't play.
+            h = f"[height<={height}]"
             params["format"] = (
-                f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/bv*[height<={height}]+ba"
-                f"/b[height<={height}]/wv*+ba/w"
+                f"bv*{h}[vcodec^=avc1]+ba[ext=m4a]/bv*{h}[ext=mp4]+ba[ext=m4a]"
+                f"/bv*{h}+ba/b{h}/wv*+ba/w"
             )
             params["merge_output_format"] = "mp4"
 

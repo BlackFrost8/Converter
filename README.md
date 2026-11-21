@@ -55,7 +55,9 @@ Things to know about free hosting:
 
 - Render's free tier sleeps after about 15 minutes idle. The page pings the service when it opens, and shows
   "Waking up the link service" if a conversion starts before it is awake (up to about a minute).
-- YouTube often blocks or rate-limits downloads from data-centre servers ("Sign in to confirm you're not a bot").
+- YouTube sometimes answers data-centre servers with "Sign in to confirm you're not a bot", especially after
+  many requests in a short time. In testing it came and went within minutes. The page then shows
+  "YouTube is blocking this server right now"; trying again later usually works.
   If that happens, add a `cookies.txt` exported from a logged-in browser as a Render **Secret File** and set
   `YTDLP_COOKIES_FILE=/etc/secrets/cookies.txt`, or route downloads through a proxy with `YTDLP_PROXY`.
   Cookies tie downloads to that account; use a spare one.

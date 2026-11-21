@@ -119,6 +119,7 @@ def test_quality_cap_in_format(fake, media, tmp_path):
     fake.source = media["mp4"]
     download("https://youtu.be/q", "webm", tmp_path, Options(max_height=480))
     assert "height<=480" in fake.calls[-1]["format"]
+    assert fake.calls[-1]["format"].startswith("bv*[height<=480][vcodec^=avc1]")
     download("https://youtu.be/q", "gif", tmp_path, Options(end=1))
     assert "height<=720" in fake.calls[-1]["format"]
 
