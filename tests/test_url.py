@@ -129,3 +129,10 @@ def test_too_long_reports_reason(fake, media, tmp_path):
     fake.duration = 5 * 3600
     with pytest.raises(ConversionError, match="too long"):
         download("https://youtu.be/long", "mp3", tmp_path)
+
+
+def test_youtube_error_messages():
+    from converter.youtube_downloader import _clean
+    assert "age-restricted" in _clean("ERROR: [youtube] x: Sign in to confirm your age. This video may be inappropriate")
+    assert "not a bot" in _clean("ERROR: [youtube] x: Sign in to confirm you\u2019re not a bot. This helps protect")
+    assert "unavailable" in _clean("ERROR: [youtube] x: Video unavailable. This video is not available")

@@ -135,8 +135,15 @@ def _clean(msg: str) -> str:
         return "That site or link is not supported."
     if "Unable to connect to proxy" in msg or "Failed to resolve" in msg or "getaddrinfo" in msg:
         return "Could not reach that site. Check the server's internet connection."
-    if "Sign in to confirm" in msg:
-        return "YouTube is asking this server to sign in (often due to rate limiting). Try again later."
+    if "confirm your age" in msg or "age-restricted" in msg or "inappropriate for some users" in msg:
+        return "This video is age-restricted on YouTube, so it can't be downloaded without a signed-in account."
+    if "not a bot" in msg or "Sign in to confirm" in msg:
+        return ("YouTube is refusing this video to the server with its \"not a bot\" check. "
+                "Some videos are refused more than others; try again later or try another video.")
+    if "Private video" in msg:
+        return "This video is private."
+    if "Video unavailable" in msg or "This video is not available" in msg:
+        return "This video is unavailable (removed, private, or blocked in the server's country)."
     return msg.strip()[:300]
 
 
