@@ -17,7 +17,7 @@ from .formats import AUDIO_OUT, FRAME_OUT, IMAGE_OUT, VIDEO_OUT, category_of, no
 
 logger = logging.getLogger(__name__)
 
-ProgressFn = Callable[[float], None]
+ProgressFn = Callable[..., None]  # progress(fraction) or progress(fraction, detail)
 
 
 class ConversionError(Exception):

@@ -46,19 +46,50 @@ function targetsFor(ext) {
 let ffmpeg = null;
 let ffmpegReady = null;
 let logSink = null;
+let wasmBlobUrl = null;     // kept across cancels so a restart doesn't download again
+let loadProgress = 0;       // 0..1 of the engine download
+let onLoadProgress = null;  // set by whoever is currently showing a progress bar
+
+// Exact size of vendor/core/ffmpeg-core.wasm. Used instead of Content-Length, which is the
+// compressed size when the host gzips the file.
+const WASM_BYTES = 32232419;
+
+async function fetchWithProgress(url, expected, report) {
+  const res = await fetch(url);
+  if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} for ${url}`);
+  const total = expected || Number(res.headers.get("Content-Length")) || 0;
+  const reader = res.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    if (total) report(Math.min(got / total, 1));
+  }
+  report(1);
+  return URL.createObjectURL(new Blob(chunks, { type: "application/wasm" }));
+}
 
 function loadFFmpeg() {
   if (ffmpegReady) return ffmpegReady;
   ffmpeg = new FFmpeg();
   ffmpeg.on("log", ({ message }) => logSink && logSink(message));
   const base = new URL("./vendor/core/", import.meta.url).href;
-  ffmpegReady = ffmpeg
-    .load({ coreURL: base + "ffmpeg-core.js", wasmURL: base + "ffmpeg-core.wasm" })
-    .catch((err) => {
-      ffmpeg = null;
-      ffmpegReady = null;
-      throw new Error("Could not start the converter in this browser: " + (err?.message || err));
-    });
+  const instance = ffmpeg;
+  ffmpegReady = (async () => {
+    if (!wasmBlobUrl) {
+      wasmBlobUrl = await fetchWithProgress(base + "ffmpeg-core.wasm", WASM_BYTES, (p) => {
+        loadProgress = p;
+        onLoadProgress && onLoadProgress(p);
+      });
+    }
+    await instance.load({ coreURL: base + "ffmpeg-core.js", wasmURL: wasmBlobUrl });
+  })().catch((err) => {
+    if (ffmpeg === instance) { ffmpeg = null; ffmpegReady = null; }
+    throw new Error("Could not start the converter in this browser: " + (err?.message || err));
+  });
   return ffmpegReady;
 }
 
@@ -286,7 +317,8 @@ const el = {
   url: $("url-input"), urlInfo: $("url-info"), urlThumb: $("url-thumb"), urlTitle: $("url-title"), urlMeta: $("url-meta"),
   server: $("server-input"), serverDot: $("server-dot"), serverHint: $("server-hint"),
   targets: $("targets"), options: $("options"), go: $("go"),
-  status: $("status"), bar: $("bar-fill"), statusText: $("status-text"), cancel: $("cancel"),
+  status: $("status"), bar: $("bar-fill"), statusText: $("status-text"), statusPct: $("status-pct"),
+  statusDetail: $("status-detail"), cancel: $("cancel"), advanced: $("advanced"),
   result: $("result"), download: $("download"), again: $("again"),
 };
 
@@ -411,12 +443,20 @@ window.addEventListener("drop", (e) => {
 
 // ---- link server
 
-const DEFAULT_SERVER = "http://127.0.0.1:5000";
+// Where links are sent. Order: the visitor's own override (Link service settings),
+// the site's own origin when app.py serves the page, config.js, then a local app.py.
+const CONFIG = window.CONVERTER_CONFIG || {};
+function defaultServer() {
+  if (CONFIG.servedByApp) return location.origin;  // app.py serves its own config.js with this flag
+  if (CONFIG.linkServer) return CONFIG.linkServer;
+  return "http://127.0.0.1:5000";
+}
 const store = {
   get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
   set: (k, v) => { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } },
 };
-el.server.value = store.get("linkServer") || DEFAULT_SERVER;
+el.server.value = store.get("linkServer") || defaultServer();
+el.server.placeholder = defaultServer();
 const serverBase = () => el.server.value.trim().replace(/\/+$/, "");
 
 async function api(path, body) {
@@ -430,12 +470,12 @@ async function api(path, body) {
 }
 
 let serverOk = false;
-async function checkServer() {
+async function checkServer(timeoutMs = 5000) {
   el.serverDot.className = "dot";
   try {
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 4000);
-    const res = await fetch(serverBase() + "/api/formats", { signal: ctl.signal });
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    const res = await fetch(serverBase() + "/healthz", { signal: ctl.signal, cache: "no-store" });
     clearTimeout(timer);
     serverOk = res.ok;
   } catch {
@@ -446,7 +486,27 @@ async function checkServer() {
   el.serverHint.hidden = serverOk;
   return serverOk;
 }
-el.server.addEventListener("change", () => { store.set("linkServer", serverBase()); checkServer(); });
+el.server.addEventListener("change", () => {
+  const v = serverBase();
+  if (!v || v === defaultServer()) { el.server.value = defaultServer(); try { localStorage.removeItem("linkServer"); } catch {} }
+  else store.set("linkServer", v);
+  checkServer();
+});
+
+const isLocalServer = () => /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(serverBase());
+
+/** Make sure the link service is up, waiting for a sleeping free-tier host to wake. */
+async function ensureServer() {
+  if (await checkServer(5000)) return;
+  if (isLocalServer()) {
+    el.advanced.open = true;
+    throw new Error('No link service is running on this computer. Start one with "python app.py", or set a link service below.');
+  }
+  showStatus("Waking up the link service", { detail: "This can take up to a minute after it has been idle." });
+  if (await checkServer(70000)) return;
+  el.advanced.open = true;
+  throw new Error("The link service is offline right now. Try again later.");
+}
 
 let infoTimer = null, infoFor = "";
 el.url.addEventListener("input", () => {
@@ -459,7 +519,7 @@ el.url.addEventListener("input", () => {
 async function loadInfo() {
   const url = el.url.value.trim();
   if (!/^https?:\/\/\S+\.\S+/.test(url) || url === infoFor) { if (!url) el.urlInfo.hidden = true; return; }
-  if (!serverOk && !(await checkServer())) return;
+  if (!serverOk && !(await checkServer(isLocalServer() ? 5000 : 70000))) return;
   infoFor = url;
   el.urlInfo.hidden = false;
   el.urlThumb.src = "";
@@ -488,17 +548,41 @@ document.querySelectorAll(".mode").forEach((btn) => btn.addEventListener("click"
   state.target = null;
   resetResult();
   renderTargets();
-  if (state.mode === "url") { el.url.focus(); checkServer(); }
+  if (state.mode === "url") { el.url.focus(); if (!serverOk) checkServer(isLocalServer() ? 5000 : 70000); }
 }));
 
 // ---- run
 
-function showStatus(text, { progress = null, error = false } = {}) {
-  el.status.hidden = false;
+// Percentage readout eases toward the real value so it counts up smoothly between updates.
+let shownPct = 0, targetPct = 0, pctRaf = 0;
+function tickPct() {
+  shownPct += (targetPct - shownPct) * 0.18;
+  if (Math.abs(targetPct - shownPct) < 0.4) shownPct = targetPct;
+  el.statusPct.textContent = `${Math.round(shownPct)}%`;
+  pctRaf = shownPct === targetPct ? 0 : requestAnimationFrame(tickPct);
+}
+
+function showStatus(label, { progress = null, detail = "", error = false } = {}) {
+  if (el.status.hidden) {
+    el.status.hidden = false;
+    el.status.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
   el.status.classList.toggle("is-error", error);
   el.status.classList.toggle("is-indeterminate", progress === null && !error);
-  el.bar.style.width = progress === null ? "" : `${Math.round(progress * 100)}%`;
-  el.statusText.textContent = text;
+  el.statusText.textContent = label;
+  el.statusDetail.textContent = detail || "";
+  if (progress === null || error) {
+    el.bar.style.width = "";
+    el.statusPct.textContent = "";
+    shownPct = targetPct = 0;
+    cancelAnimationFrame(pctRaf); pctRaf = 0;
+    return;
+  }
+  const pct = Math.max(0, Math.min(100, progress * 100));
+  if (pct < targetPct - 0.5) shownPct = pct; // new stage started: jump back instead of counting down
+  targetPct = pct;
+  el.bar.style.width = `${pct}%`;
+  if (!pctRaf) pctRaf = requestAnimationFrame(tickPct);
 }
 
 function resetResult() {
@@ -521,6 +605,8 @@ function setBusy(busy, cancel = null) {
   state.busy = busy;
   state.cancel = cancel;
   el.cancel.hidden = !cancel;
+  if (busy) el.go.hidden = true;                    // the progress panel takes the button's place
+  else if (el.result.hidden) el.go.hidden = false;  // error / cancel: offer the button again
   updateUI();
 }
 
@@ -530,32 +616,38 @@ async function runFile() {
   const stem = state.file.name.replace(/\.[^.]+$/, "") || "converted";
   let cancelled = false;
   setBusy(true, () => { cancelled = true; cancelFFmpeg(); });
-  showStatus(ffmpeg ? "Converting…" : "Loading converter (first time only)…");
+  const showLoad = (p) => showStatus("Loading converter", { progress: p, detail: "First run only · 31 MB, cached afterwards" });
   try {
+    if (!wasmBlobUrl) { showLoad(loadProgress); onLoadProgress = showLoad; }
+    else if (!ffmpeg) showStatus("Starting converter");
     await loadFFmpeg();
+    onLoadProgress = null;
     if (cancelled) return;
-    showStatus("Converting…");
-    const blob = await convertFile(state.file, target, o, (p) => showStatus(`Converting ${Math.round(p * 100)}%`, { progress: p }));
+    showStatus("Converting", { progress: 0, detail: `${state.file.name} → ${target.toUpperCase()}` });
+    const blob = await convertFile(state.file, target, o,
+      (p) => showStatus("Converting", { progress: p, detail: `${state.file.name} → ${target.toUpperCase()}` }));
     state.objectUrl = URL.createObjectURL(blob);
     finish(state.objectUrl, `${stem}.${target}`, blob.size, true);
   } catch (err) {
     if (cancelled) showStatus("Cancelled.", { error: true });
     else throw err;
   } finally {
+    onLoadProgress = null;
     setBusy(false);
   }
 }
 
 async function runLink() {
   const o = readOptions();
-  if (!(await checkServer())) throw new Error(`No link server at ${serverBase()}. Start one with "python app.py", or enter another address.`);
   const body = { url: el.url.value.trim(), target: state.target, bitrate: o.bitrate, gif_fps: o.gif_fps, gif_width: o.gif_width };
   if (o.start != null) body.start = o.start;
   if (o.end != null) body.end = o.end;
   let cancelled = false;
   setBusy(true, () => { cancelled = true; });
-  showStatus("Starting…");
+  showStatus("Connecting");
   try {
+    await ensureServer();
+    if (cancelled) return;
     const job = await api("/api/url", body);
     while (!cancelled) {
       const j = await api(`/api/jobs/${job.id}`);
@@ -563,12 +655,12 @@ async function runLink() {
         return finish(`${serverBase()}/api/jobs/${j.id}/download`, j.filename, j.size, false);
       }
       if (j.status === "error") throw new Error(j.error || "Conversion failed.");
-      const verb = j.progress < 0.7 ? "Downloading" : "Converting";
-      showStatus(j.status === "queued" ? "Waiting in queue…" : `${verb}${j.progress > 0 ? ` ${Math.round(j.progress * 100)}%` : "…"}`,
-        { progress: j.progress > 0 ? j.progress : null });
+      if (j.status === "queued") showStatus("Waiting in queue", { detail: "Other conversions are running." });
+      else if (j.progress === 0) showStatus("Fetching video info");
+      else showStatus(j.progress < 0.7 ? "Downloading" : "Converting", { progress: j.progress, detail: j.detail || "" });
       await new Promise((r) => setTimeout(r, 700));
     }
-    showStatus("Stopped watching. The link server may still finish the job.", { error: true });
+    showStatus("Cancelled.", { error: true });
   } finally {
     setBusy(false);
   }
@@ -581,7 +673,7 @@ el.go.addEventListener("click", async () => {
   try {
     await (state.mode === "file" ? runFile() : runLink());
   } catch (err) {
-    const msg = err instanceof TypeError ? `Could not reach the link server at ${serverBase()}.` : err.message;
+    const msg = err instanceof TypeError ? "Lost connection to the link service. Try again." : err.message;
     showStatus(msg || "Conversion failed.", { error: true });
   }
 });
@@ -601,3 +693,6 @@ el.again.addEventListener("click", () => {
 
 el.dropSub.dataset.default = el.dropSub.textContent;
 renderTargets();
+// Quietly wake a sleeping hosted link service early, so links are fast when needed.
+// (Not for a local one: pinging localhost on page load makes Chrome show a permission prompt.)
+if (!isLocalServer()) checkServer(70000);

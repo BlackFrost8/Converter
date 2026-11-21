@@ -14,7 +14,8 @@ Inputs accepted: `mp4 mkv mov avi webm flv m4v wmv mpeg 3gp ts`, `mp3 wav aac m4
 
 ## Setup
 
-Requires Python 3.10+ and [ffmpeg](https://ffmpeg.org/download.html) on your `PATH`.
+Requires Python 3.10+ and [ffmpeg](https://ffmpeg.org/download.html) on your `PATH`. `requirements.txt` also
+installs Deno, the JavaScript runtime yt-dlp now needs for YouTube.
 
 ```bash
 git clone https://github.com/BlackFrost8/Converter.git
@@ -24,52 +25,63 @@ pip install -r requirements.txt
 
 No system ffmpeg? `pip install imageio-ffmpeg` provides a bundled binary that is picked up automatically.
 
-## Web interface
+## How it fits together
+
+- **The page** (`docs/`) converts files **in the visitor's browser** with
+  [ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm). Nothing is uploaded. A progress bar shows the
+  one-time engine download (31 MB, cached afterwards) and then the conversion percentage.
+- **The link service** (`app.py`) downloads YouTube and other links with yt-dlp, converts them with ffmpeg,
+  and hands back the file, with download speed and time left shown in the progress bar. Browsers can't download
+  YouTube media themselves, so links always need this service running somewhere.
+
+`app.py` also serves the page itself, so one deployment gives you a complete online converter.
+
+## Put it online (works like any online converter)
+
+1. **Deploy the link service.** The repo includes a `Dockerfile` and a Render Blueprint (`render.yaml`):
+   create a free account at [render.com](https://render.com), then **New → Blueprint**, pick this repository and
+   click **Apply**. After the build, Render gives you an address like `https://converter-xxxx.onrender.com`.
+   That address alone is already a full converter site.
+2. **Point the GitHub Pages site at it.** Edit `docs/config.js` and set
+   `linkServer: "https://converter-xxxx.onrender.com"`. Commit and push.
+3. **Turn on Pages:** Settings → Pages → Deploy from a branch → `main`, folder **`/docs`**. The custom domain
+   `convert.froststudio.org` is set by `docs/CNAME`.
+
+Visitors then paste a link, pick MP3 or MP4, and download, with no setup on their side.
+
+Things to know about free hosting:
+
+- Render's free tier sleeps after about 15 minutes idle. The page pings the service when it opens, and shows
+  "Waking up the link service" if a conversion starts before it is awake (up to about a minute).
+- YouTube often blocks or rate-limits downloads from data-centre servers ("Sign in to confirm you're not a bot").
+  If that happens, add a `cookies.txt` exported from a logged-in browser as a Render **Secret File** and set
+  `YTDLP_COOKIES_FILE=/etc/secrets/cookies.txt`, or route downloads through a proxy with `YTDLP_PROXY`.
+  Cookies tie downloads to that account; use a spare one.
+- Keep yt-dlp current: redeploying rebuilds the image with the newest version.
+
+## Run it locally
 
 ```bash
 python app.py
 ```
 
-Open http://127.0.0.1:5000, drop a file (or paste a link), pick a format, convert, download.
-Conversions run in the background with live progress; results are deleted an hour after they finish.
+Open http://127.0.0.1:5000. The Pages site also uses this local service for links when `config.js` has no
+`linkServer` set (Chrome may ask permission first; Safari may block it).
 
-| Environment variable       | Default                  | Meaning                         |
-| -------------------------- | ------------------------ | ------------------------------- |
-| `HOST` / `PORT`            | `127.0.0.1` / `5000`     | Where `app.py` listens          |
-| `CONVERTER_MAX_UPLOAD_MB`  | `1024`                   | Upload size limit               |
-| `CONVERTER_WORKERS`        | `2`                      | Conversions run in parallel     |
-| `CONVERTER_WORKDIR`        | system temp dir          | Where uploads and results live  |
-| `CONVERTER_ALLOWED_ORIGINS`| `https://blackfrost8.github.io` | Sites allowed to use this server for links (CORS) |
+| Environment variable        | Default                         | Meaning                                         |
+| --------------------------- | ------------------------------- | ----------------------------------------------- |
+| `HOST` / `PORT`             | `127.0.0.1` / `5000`            | Where `app.py` listens                          |
+| `CONVERTER_ALLOWED_ORIGINS` | `https://convert.froststudio.org,https://blackfrost8.github.io` | Other sites allowed to use this service (CORS) |
+| `CONVERTER_RATE_LIMIT`      | `0` (unlimited); Docker: `30`   | Conversions per visitor IP per hour             |
+| `CONVERTER_MAX_QUEUE`       | `20`                            | Jobs waiting or running before "busy" replies   |
+| `CONVERTER_WORKERS`         | `2`                             | Conversions run in parallel                     |
+| `CONVERTER_MAX_UPLOAD_MB`   | `1024`; Docker: `200`           | Upload limit for the `/api/convert` endpoint    |
+| `CONVERTER_BEHIND_PROXY`    | unset; Docker: `1`              | Trust one reverse proxy for the client IP       |
+| `CONVERTER_WORKDIR`         | system temp dir                 | Where downloads and results live (1 hour)       |
+| `YTDLP_COOKIES_FILE`        | unset                           | Cookies file for yt-dlp                         |
+| `YTDLP_PROXY`               | unset                           | Proxy URL for yt-dlp                            |
 
-The built-in server is meant for personal or local-network use. To expose it publicly, run it behind a
-production WSGI server (e.g. `gunicorn -w 1 --threads 8 app:app`) and add authentication: anyone with
-access can make the server download and transcode media. Use a single worker process, because job state
-lives in memory.
-
-## GitHub Pages (browser) version
-
-`docs/` is a static copy of the interface that converts files **inside the visitor's browser** using
-[ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm). Nothing is uploaded, and no server is needed for files.
-
-To publish it: repository **Settings → Pages → Build and deployment → Deploy from a branch**, choose the
-branch that contains `docs/`, folder **`/docs`**, then save. The site appears at
-`https://<user>.github.io/Converter/` after a minute or two.
-
-**Links (YouTube etc.) need a link server.** Browsers won't let a web page download YouTube media from
-another site, and GitHub Pages can't run code. So the Link tab sends links to the Python app in this repo:
-
-```bash
-python app.py        # on your own computer; the Pages site talks to http://127.0.0.1:5000
-```
-
-Or deploy `app.py` somewhere public and enter its address in the "Link server" box. The server only accepts
-requests from origins listed in `CONVERTER_ALLOWED_ORIGINS` (default `https://blackfrost8.github.io`;
-comma-separated).
-
-Browser notes: Chrome may ask permission before a public site can talk to a server on your computer or local
-network. Safari may block an https page from calling `http://127.0.0.1`. Use Chrome, Edge or Firefox for the Link tab.
-In-browser conversion is single-threaded and slower than the Python app; very large files can exceed the
-browser's memory.
+Jobs live in memory, so run a single server process (the Dockerfile uses one gunicorn worker with threads).
 
 ## Command line
 

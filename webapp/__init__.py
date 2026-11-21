@@ -1,4 +1,9 @@
-"""Flask web interface for the converter."""
+"""Flask server: serves the converter page (docs/) and the API used for links.
+
+Files are converted in the visitor's browser; this server does the work browsers can't:
+downloading from YouTube and other sites. /api/convert (server-side file conversion) is
+kept for API and script use.
+"""
 
 from __future__ import annotations
 
@@ -9,12 +14,14 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from flask import Flask, abort, jsonify, render_template, request, send_file
+from flask import Flask, abort, jsonify, request, send_file, send_from_directory
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
 from converter.engine import ConversionError, Options, convert
@@ -23,7 +30,17 @@ from converter.youtube_downloader import download, fetch_info, is_valid_url
 
 logger = logging.getLogger(__name__)
 
+SITE_DIR = Path(__file__).resolve().parent.parent / "docs"
 JOB_TTL_SECONDS = 60 * 60  # results are deleted an hour after they finish
+# Where the static (GitHub Pages) copy of the page lives; it may call this service for links.
+DEFAULT_ORIGINS = "https://convert.froststudio.org,https://blackfrost8.github.io"
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
 
 
 @dataclass
@@ -32,6 +49,7 @@ class Job:
     workdir: Path
     status: str = "queued"          # queued | running | done | error
     progress: float = 0.0
+    detail: Optional[str] = None    # e.g. "3.1 MB/s · 0:12 left"
     error: Optional[str] = None
     output: Optional[Path] = None
     download_name: Optional[str] = None
@@ -43,6 +61,7 @@ class Job:
             "id": self.id,
             "status": self.status,
             "progress": round(self.progress, 3),
+            "detail": self.detail,
             "error": self.error,
             "filename": self.download_name,
             "size": self.output.stat().st_size if self.output and self.output.exists() else None,
@@ -50,19 +69,23 @@ class Job:
 
 
 class JobStore:
-    def __init__(self, root: Path, workers: int):
+    def __init__(self, root: Path, workers: int, max_queue: int):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
         self.jobs: dict[str, Job] = {}
         self.lock = threading.Lock()
+        self.max_queue = max_queue
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="convert")
         threading.Thread(target=self._reaper, daemon=True).start()
 
     def new(self) -> Job:
-        job_id = uuid.uuid4().hex
-        job = Job(id=job_id, workdir=self.root / job_id)
-        job.workdir.mkdir()
         with self.lock:
+            pending = sum(1 for j in self.jobs.values() if j.status in ("queued", "running"))
+            if pending >= self.max_queue:
+                raise ConversionError("The converter is busy right now. Try again in a minute.")
+            job_id = uuid.uuid4().hex
+            job = Job(id=job_id, workdir=self.root / job_id)
+            job.workdir.mkdir()
             self.jobs[job_id] = job
         return job
 
@@ -74,14 +97,16 @@ class JobStore:
         def run():
             job.status = "running"
 
-            def progress(p: float):
+            def progress(p: float, detail: Optional[str] = None):
                 job.progress = max(job.progress, p)
+                job.detail = detail
 
             try:
                 out = fn(progress)
                 job.output = out
                 job.download_name = out.name
                 job.progress = 1.0
+                job.detail = None
                 job.status = "done"
             except ConversionError as e:
                 job.error, job.status = str(e), "error"
@@ -103,6 +128,28 @@ class JobStore:
                     self.jobs.pop(j.id, None)
             for j in stale:
                 shutil.rmtree(j.workdir, ignore_errors=True)
+
+
+class RateLimiter:
+    """Sliding-window limit of N job submissions per client IP per hour."""
+
+    def __init__(self, per_hour: int):
+        self.per_hour = per_hour
+        self.hits: dict[str, deque] = defaultdict(deque)
+        self.lock = threading.Lock()
+
+    def check(self, key: str) -> None:
+        if self.per_hour <= 0:
+            return
+        now = time.time()
+        with self.lock:
+            q = self.hits[key]
+            while q and now - q[0] > 3600:
+                q.popleft()
+            if len(q) >= self.per_hour:
+                wait = int(3600 - (now - q[0])) // 60 + 1
+                raise ConversionError(f"Hourly limit reached ({self.per_hour} conversions). Try again in {wait} min.")
+            q.append(now)
 
 
 def _float(value) -> Optional[float]:
@@ -129,24 +176,29 @@ def _options(data) -> Options:
 
 
 def create_app(work_root: Optional[str] = None) -> Flask:
-    app = Flask(__name__)
-    max_mb = int(os.environ.get("CONVERTER_MAX_UPLOAD_MB", "1024"))
+    app = Flask(__name__, static_folder=None)
+    if os.environ.get("CONVERTER_BEHIND_PROXY") == "1":
+        # Trust one reverse proxy (Render, Fly, nginx...) for the client IP and scheme.
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+    max_mb = _env_int("CONVERTER_MAX_UPLOAD_MB", 1024)
     app.config["MAX_CONTENT_LENGTH"] = max_mb * 1024 * 1024
     root = Path(work_root or os.environ.get("CONVERTER_WORKDIR") or Path(tempfile.gettempdir()) / "converter-jobs")
-    store = JobStore(root, workers=int(os.environ.get("CONVERTER_WORKERS", "2")))
+    store = JobStore(root, workers=_env_int("CONVERTER_WORKERS", 2), max_queue=_env_int("CONVERTER_MAX_QUEUE", 20))
+    limiter = RateLimiter(_env_int("CONVERTER_RATE_LIMIT", 0))  # 0 = unlimited (local use)
     app.extensions["jobs"] = store
 
-    # Let the static GitHub Pages front end (docs/) use this server for links.
     allowed_origins = {
         o.strip().rstrip("/")
-        for o in os.environ.get("CONVERTER_ALLOWED_ORIGINS", "https://blackfrost8.github.io").split(",")
+        for o in os.environ.get("CONVERTER_ALLOWED_ORIGINS", DEFAULT_ORIGINS).split(",")
         if o.strip()
     }
 
     @app.after_request
-    def cors(response):
+    def headers(response):
         origin = request.headers.get("Origin", "").rstrip("/")
-        if request.path.startswith("/api/") and (origin in allowed_origins or "*" in allowed_origins):
+        is_api = request.path.startswith("/api/") or request.path == "/healthz"
+        if is_api and (origin in allowed_origins or "*" in allowed_origins):
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type"
@@ -159,15 +211,39 @@ def create_app(work_root: Optional[str] = None) -> Flask:
 
     @app.errorhandler(ConversionError)
     def conversion_error(e):
-        return jsonify(error=str(e)), 400
+        status = 429 if "limit" in str(e) or "busy" in str(e) else 400
+        return jsonify(error=str(e)), status
 
     @app.errorhandler(413)
     def too_large(_):
         return jsonify(error=f"File is larger than the {max_mb} MB limit."), 413
 
+    # ---------------------------------------------------------------- site
+
     @app.get("/")
     def index():
-        return render_template("index.html", max_mb=max_mb)
+        return send_from_directory(SITE_DIR, "index.html")
+
+    @app.get("/config.js")
+    def site_config():
+        # Overrides docs/config.js: this page should send links to this same server.
+        body = 'window.CONVERTER_CONFIG = { linkServer: "", servedByApp: true };\n'
+        return app.response_class(body, mimetype="text/javascript", headers={"Cache-Control": "no-cache"})
+
+    @app.get("/<path:filename>")
+    def site_file(filename):
+        if filename.startswith("api/"):
+            abort(404)
+        response = send_from_directory(SITE_DIR, filename)
+        if filename.startswith("vendor/"):
+            response.cache_control.max_age = 7 * 24 * 3600  # 31 MB wasm: cache it
+        return response
+
+    @app.get("/healthz")
+    def healthz():
+        return jsonify(ok=True)
+
+    # ---------------------------------------------------------------- api
 
     @app.get("/api/formats")
     def formats():
@@ -186,6 +262,7 @@ def create_app(work_root: Optional[str] = None) -> Flask:
         if target not in targets_for(ext):
             raise ConversionError(f"Cannot convert .{ext} to .{target or '?'}.")
         opts = _options(request.form)
+        limiter.check(request.remote_addr or "?")
 
         job = store.new()
         src = job.workdir / f"input.{ext}"
@@ -203,6 +280,7 @@ def create_app(work_root: Optional[str] = None) -> Flask:
             raise ConversionError("Enter a valid http(s) link.")
         target = normalize(str(data.get("target", "")))
         opts = _options(data)
+        limiter.check(request.remote_addr or "?")
         job = store.new()
         store.submit(job, lambda progress: download(url, target, job.workdir / "out", opts, progress))
         return jsonify(job.public()), 202
